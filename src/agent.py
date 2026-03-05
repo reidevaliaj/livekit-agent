@@ -12,6 +12,7 @@ from livekit.agents import (
     AgentSession,
     JobContext,
     JobProcess,
+    get_job_context,
     cli,
     inference,
     room_io,
@@ -89,6 +90,14 @@ def _flatten_message_content(content: Any) -> str:
                 if isinstance(transcript_value, str):
                     parts.append(transcript_value)
                     continue
+            text_attr = getattr(item, "text", None)
+            if isinstance(text_attr, str):
+                parts.append(text_attr)
+                continue
+            transcript_attr = getattr(item, "transcript", None)
+            if isinstance(transcript_attr, str):
+                parts.append(transcript_attr)
+                continue
         return " ".join(parts).strip()
     return str(content)
 
@@ -98,7 +107,12 @@ def _build_transcript_payload(
 ) -> Dict[str, Any]:
     messages: list[Dict[str, Any]] = []
     lines: list[str] = []
-    for msg in session.history.messages:
+    history_messages = (
+        session.history.messages()
+        if callable(getattr(session.history, "messages", None))
+        else session.history.messages
+    )
+    for msg in history_messages:
         if msg.role not in ("user", "assistant"):
             continue
         text = _flatten_message_content(msg.content).strip()
@@ -169,7 +183,7 @@ Rules:
         It sends a structured summary to our backend.
         """
         try:
-            ctx: JobContext = context.job_ctx  # LiveKit provides job context here
+            ctx: JobContext = get_job_context()
             room = ctx.room
             payload = {
                 "tenant_id": TENANT_ID,
