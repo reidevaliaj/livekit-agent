@@ -54,9 +54,20 @@ def _best_effort_caller_id(room: rtc.Room) -> Optional[str]:
 
 async def _post_json(path: str, payload: Dict[str, Any]) -> None:
     url = FASTAPI_BASE_URL.rstrip("/") + path
+    logger.info(
+        "[TRANSCRIPT_POST] sending path=%s url=%s payload_keys=%s",
+        path,
+        url,
+        sorted(payload.keys()),
+    )
     timeout = httpx.Timeout(10.0, connect=10.0)
     async with httpx.AsyncClient(timeout=timeout) as client:
         r = await client.post(url, json=payload)
+        logger.info(
+            "[TRANSCRIPT_POST] response path=%s status=%s",
+            path,
+            r.status_code,
+        )
         r.raise_for_status()
 
 
@@ -195,6 +206,7 @@ server.setup_fnc = prewarm
 @server.rtc_session(agent_name="my-agent")
 async def my_agent(ctx: JobContext):
     ctx.log_context_fields = {"room": ctx.room.name}
+    logger.info("[CALL_START] room=%s", ctx.room.name)
 
     session = AgentSession(
         stt=inference.STT(model="deepgram/nova-3", language="multi"),
@@ -224,18 +236,33 @@ async def my_agent(ctx: JobContext):
     )
 
     async def _send_transcript_on_shutdown(reason: str) -> None:
+        logger.info(
+            "[CALL_END] shutdown callback fired room=%s reason=%s",
+            ctx.room.name,
+            reason,
+        )
         try:
             payload = _build_transcript_payload(
                 session=session, room=ctx.room, shutdown_reason=reason
             )
+            logger.info(
+                "[CALL_END] transcript prepared room=%s messages=%s chars=%s",
+                ctx.room.name,
+                len(payload["messages"]),
+                len(payload["transcript"]),
+            )
             await _post_json("/events/transcript", payload)
             logger.info(
-                "Sent transcript on shutdown for room=%s with %s messages",
+                "[CALL_END] transcript sent room=%s messages=%s",
                 ctx.room.name,
                 len(payload["messages"]),
             )
         except Exception:
-            logger.exception("Failed sending transcript on shutdown")
+            logger.exception(
+                "[CALL_END] transcript send failed room=%s reason=%s",
+                ctx.room.name,
+                reason,
+            )
 
     ctx.add_shutdown_callback(_send_transcript_on_shutdown)
 
