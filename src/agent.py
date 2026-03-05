@@ -60,6 +60,61 @@ async def _post_json(path: str, payload: Dict[str, Any]) -> None:
         r.raise_for_status()
 
 
+def _flatten_message_content(content: Any) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for item in content:
+            if isinstance(item, str):
+                parts.append(item)
+                continue
+            if isinstance(item, dict):
+                text_value = item.get("text")
+                if isinstance(text_value, str):
+                    parts.append(text_value)
+                    continue
+                transcript_value = item.get("transcript")
+                if isinstance(transcript_value, str):
+                    parts.append(transcript_value)
+                    continue
+        return " ".join(parts).strip()
+    return str(content)
+
+
+def _build_transcript_payload(
+    session: AgentSession, room: rtc.Room, shutdown_reason: str
+) -> Dict[str, Any]:
+    messages: list[Dict[str, Any]] = []
+    lines: list[str] = []
+    for msg in session.history.messages:
+        if msg.role not in ("user", "assistant"):
+            continue
+        text = _flatten_message_content(msg.content).strip()
+        if not text:
+            continue
+        line = f"{msg.role}: {text}"
+        lines.append(line)
+        messages.append(
+            {
+                "role": msg.role,
+                "text": text,
+                "interrupted": bool(getattr(msg, "interrupted", False)),
+                "created_at": getattr(msg, "created_at", None),
+            }
+        )
+
+    return {
+        "tenant_id": TENANT_ID,
+        "room_name": room.name if room else None,
+        "caller_id": _best_effort_caller_id(room) if room else None,
+        "shutdown_reason": shutdown_reason,
+        "timestamp": int(time.time()),
+        "transcript": "\n".join(lines),
+        "messages": messages,
+    }
+
+
 class Assistant(Agent):
     def __init__(self) -> None:
         super().__init__(
@@ -167,6 +222,22 @@ async def my_agent(ctx: JobContext):
             ),
         ),
     )
+
+    async def _send_transcript_on_shutdown(reason: str) -> None:
+        try:
+            payload = _build_transcript_payload(
+                session=session, room=ctx.room, shutdown_reason=reason
+            )
+            await _post_json("/events/transcript", payload)
+            logger.info(
+                "Sent transcript on shutdown for room=%s with %s messages",
+                ctx.room.name,
+                len(payload["messages"]),
+            )
+        except Exception:
+            logger.exception("Failed sending transcript on shutdown")
+
+    ctx.add_shutdown_callback(_send_transcript_on_shutdown)
 
     await ctx.connect()
     await session.say("Thanks for calling Code Studio. How may we help you today?")
