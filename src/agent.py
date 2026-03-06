@@ -1,7 +1,9 @@
-import os
+﻿import os
 import time
 import logging
+from datetime import datetime, timedelta, timezone
 from typing import Optional, Dict, Any
+from zoneinfo import ZoneInfo
 
 import httpx
 from dotenv import load_dotenv
@@ -32,20 +34,15 @@ load_dotenv(".env.local")
 # Config
 # -----------------------------
 FASTAPI_BASE_URL = os.getenv("FASTAPI_BASE_URL", "https://voice.code-studio.eu")
-TENANT_ID = os.getenv("TENANT_ID", "codestudio")  # later: dynamic per customer
+TENANT_ID = os.getenv("TENANT_ID", "codestudio")
+BUSINESS_TIMEZONE = os.getenv("BUSINESS_TIMEZONE", "Europe/Budapest")
 
 
 def _best_effort_caller_id(room: rtc.Room) -> Optional[str]:
-    """
-    SIP calls typically show participant identities like:
-      sip_+355....
-    This is best-effort because exact fields can vary.
-    """
     try:
         for p in room.remote_participants.values():
             if "sip" in (p.identity or "").lower():
                 return p.identity
-        # fallback: first remote participant identity
         for p in room.remote_participants.values():
             return p.identity
     except Exception:
@@ -56,20 +53,26 @@ def _best_effort_caller_id(room: rtc.Room) -> Optional[str]:
 async def _post_json(path: str, payload: Dict[str, Any]) -> None:
     url = FASTAPI_BASE_URL.rstrip("/") + path
     logger.info(
-        "[TRANSCRIPT_POST] sending path=%s url=%s payload_keys=%s",
+        "[HTTP_POST] sending path=%s url=%s payload_keys=%s",
         path,
         url,
         sorted(payload.keys()),
     )
-    timeout = httpx.Timeout(10.0, connect=10.0)
+    timeout = httpx.Timeout(12.0, connect=10.0)
     async with httpx.AsyncClient(timeout=timeout) as client:
         r = await client.post(url, json=payload)
-        logger.info(
-            "[TRANSCRIPT_POST] response path=%s status=%s",
-            path,
-            r.status_code,
-        )
+        logger.info("[HTTP_POST] response path=%s status=%s", path, r.status_code)
         r.raise_for_status()
+
+
+async def _post_json_and_read(path: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+    url = FASTAPI_BASE_URL.rstrip("/") + path
+    timeout = httpx.Timeout(12.0, connect=10.0)
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        r = await client.post(url, json=payload)
+        logger.info("[HTTP_POST] response path=%s status=%s", path, r.status_code)
+        r.raise_for_status()
+        return r.json()
 
 
 def _flatten_message_content(content: Any) -> str:
@@ -118,8 +121,7 @@ def _build_transcript_payload(
         text = _flatten_message_content(msg.content).strip()
         if not text:
             continue
-        line = f"{msg.role}: {text}"
-        lines.append(line)
+        lines.append(f"{msg.role}: {text}")
         messages.append(
             {
                 "role": msg.role,
@@ -140,12 +142,29 @@ def _build_transcript_payload(
     }
 
 
+def _format_slot_for_voice(slot: Dict[str, Any]) -> str:
+    start_raw = str(slot.get("start", ""))
+    end_raw = str(slot.get("end", ""))
+    if not start_raw or not end_raw:
+        return ""
+    try:
+        start = datetime.fromisoformat(start_raw)
+        end = datetime.fromisoformat(end_raw)
+    except ValueError:
+        return ""
+    return (
+        f"{start.strftime('%A %d %B at %H:%M')} to {end.strftime('%H:%M')} "
+        f"({start.tzname() or BUSINESS_TIMEZONE})"
+    )
+
+
 class Assistant(Agent):
-    def __init__(self) -> None:
+    def __init__(self, call_context_text: str) -> None:
         super().__init__(
-            instructions="""
+            instructions=(
+                """
 You are the voice assistant for Code Studio (web development + AI automation agency).
-Your goal is to understand WHY the person called and capture the minimum details needed.
+Your goal is to understand why the person called and capture the minimum details needed.
 
 Call types:
 1) Sales lead (website, e-commerce, automation, AI, voice AI)
@@ -157,12 +176,57 @@ Rules:
 - Keep responses short (phone style).
 - Ask only the needed questions.
 - Do not promise prices or timelines.
-- If it’s a sales lead: capture name, company, what they need, best email/phone.
+- If sales lead: capture name, company, need, best email/phone.
 - If support: capture name, company, problem, urgency, best contact.
-- If meeting: capture name, company, topic, best contact and preferred time window.
-- At the end (or when you have enough info), send a structured “call_end” event.
+- If meeting: use check_availability to offer slots in next 2 weeks.
+- If caller asks for a meeting beyond 2 weeks, say that the responsible person will handle it after the call.
+- Confirm a meeting slot only after explicit user agreement.
+- At the end (or when enough info), send call_end event.
+
+Call context:
 """.strip()
+                + "\n"
+                + call_context_text
+            )
         )
+
+    @function_tool
+    async def check_availability(
+        self,
+        context: RunContext,
+        duration_minutes: int = 30,
+    ) -> str:
+        """
+        Use when user asks for a meeting time.
+        Returns free slots from backend for the next 2 weeks.
+        """
+        try:
+            payload = {
+                "tenant_id": TENANT_ID,
+                "duration_minutes": duration_minutes,
+                "max_slots": 5,
+            }
+            data = await _post_json_and_read("/tools/check-availability", payload)
+            slots = data.get("slots", []) if isinstance(data, dict) else []
+            if not slots:
+                return (
+                    "I could not find free slots in the next two weeks. "
+                    "Our team will follow up after this call."
+                )
+
+            lines: list[str] = []
+            for idx, slot in enumerate(slots[:3], start=1):
+                spoken = _format_slot_for_voice(slot)
+                if spoken:
+                    lines.append(f"{idx}) {spoken}")
+
+            if not lines:
+                return "I found availability but could not format the slots right now."
+
+            return "Here are the next available options: " + " ; ".join(lines)
+        except Exception as e:
+            logger.exception("check_availability failed")
+            return f"I could not check the calendar right now: {e}"
 
     @function_tool
     async def call_end(
@@ -179,15 +243,14 @@ Rules:
         preferred_time_window: str = "",
     ) -> str:
         """
-        Use this tool when the call is finished or you have enough info.
-        It sends a structured summary to our backend.
+        Use this tool when the call is finished or enough info is collected.
         """
         try:
             ctx: JobContext = get_job_context()
             room = ctx.room
             payload = {
                 "tenant_id": TENANT_ID,
-                "call_type": call_type,  # "sales" | "support" | "meeting" | "other"
+                "call_type": call_type,
                 "name": name,
                 "company": company,
                 "contact_email": contact_email,
@@ -222,6 +285,15 @@ async def my_agent(ctx: JobContext):
     ctx.log_context_fields = {"room": ctx.room.name}
     logger.info("[CALL_START] room=%s", ctx.room.name)
 
+    now_utc = datetime.now(timezone.utc)
+    now_local = now_utc.astimezone(ZoneInfo(BUSINESS_TIMEZONE))
+    two_weeks_local = now_local + timedelta(days=14)
+    call_context_text = (
+        f"Current UTC time: {now_utc.isoformat()}\n"
+        f"Current business local time ({BUSINESS_TIMEZONE}): {now_local.isoformat()}\n"
+        f"Meeting booking horizon ends at ({BUSINESS_TIMEZONE}): {two_weeks_local.isoformat()}"
+    )
+
     session = AgentSession(
         stt=inference.STT(model="deepgram/nova-3", language="multi"),
         llm=inference.LLM(model="openai/gpt-4.1-mini"),
@@ -235,7 +307,7 @@ async def my_agent(ctx: JobContext):
     )
 
     await session.start(
-        agent=Assistant(),
+        agent=Assistant(call_context_text=call_context_text),
         room=ctx.room,
         room_options=room_io.RoomOptions(
             audio_input=room_io.AudioInputOptions(
@@ -250,11 +322,7 @@ async def my_agent(ctx: JobContext):
     )
 
     async def _send_transcript_on_shutdown(reason: str) -> None:
-        logger.info(
-            "[CALL_END] shutdown callback fired room=%s reason=%s",
-            ctx.room.name,
-            reason,
-        )
+        logger.info("[CALL_END] shutdown callback fired room=%s reason=%s", ctx.room.name, reason)
         try:
             payload = _build_transcript_payload(
                 session=session, room=ctx.room, shutdown_reason=reason
