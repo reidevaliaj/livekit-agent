@@ -208,6 +208,18 @@ Call context:
             }
             data = await _post_json_and_read("/tools/check-availability", payload)
             slots = data.get("slots", []) if isinstance(data, dict) else []
+            degraded = bool(data.get("degraded", False)) if isinstance(data, dict) else False
+            if degraded:
+                reason = str(data.get("degraded_reason", "calendar temporarily unavailable"))
+                logger.warning(
+                    "[TOOL check_availability] degraded response; avoiding slot offer. reason=%s",
+                    reason,
+                )
+                return (
+                    "I cannot confirm live calendar availability right now. "
+                    "Please tell me your preferred day and time within the next two weeks, "
+                    "and our team will confirm it right after this call."
+                )
             if not slots:
                 return (
                     "I could not find free slots in the next two weeks. "
