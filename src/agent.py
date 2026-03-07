@@ -158,6 +158,17 @@ def _format_slot_for_voice(slot: Dict[str, Any]) -> str:
     )
 
 
+def _format_day_blocks_for_voice(day_blocks: list[Dict[str, Any]]) -> str:
+    lines: list[str] = []
+    for block in day_blocks[:3]:
+        day = str(block.get("day", "")).strip()
+        ranges = block.get("ranges", [])
+        if not day or not isinstance(ranges, list) or not ranges:
+            continue
+        lines.append(f"{day}: {', '.join(str(r) for r in ranges[:3])}")
+    return " ; ".join(lines)
+
+
 class Assistant(Agent):
     def __init__(self, call_context_text: str) -> None:
         super().__init__(
@@ -178,9 +189,12 @@ Rules:
 - Do not promise prices or timelines.
 - If sales lead: capture name, company, need, best email/phone.
 - If support: capture name, company, problem, urgency, best contact.
-- If meeting: use check_availability to offer slots in next 2 weeks.
+- If meeting: first ask the caller for their preferred date and time.
+- Then call check_meeting_slot using ISO 8601 datetime with timezone offset.
 - If caller asks for a meeting beyond 2 weeks, say that the responsible person will handle it after the call.
-- Confirm a meeting slot only after explicit user agreement.
+- Confirm a meeting slot only when check_meeting_slot returns status "free" and the caller explicitly agrees.
+- If status is "busy" or "outside_hours", offer only the returned next_slots.
+- Never invent availability or times not returned by the tool.
 - At the end (or when enough info), send call_end event.
 
 Call context:
@@ -191,54 +205,67 @@ Call context:
         )
 
     @function_tool
-    async def check_availability(
+    async def check_meeting_slot(
         self,
         context: RunContext,
+        preferred_start_iso: str,
         duration_minutes: int = 30,
     ) -> str:
         """
-        Use when user asks for a meeting time.
-        Returns free slots from backend for the next 2 weeks.
+        Use after user provides a specific preferred meeting datetime.
+        preferred_start_iso must be ISO 8601 with timezone offset.
         """
         try:
             payload = {
                 "tenant_id": TENANT_ID,
+                "preferred_start_iso": preferred_start_iso,
                 "duration_minutes": duration_minutes,
-                "max_slots": 5,
+                "alternatives_limit": 3,
             }
-            data = await _post_json_and_read("/tools/check-availability", payload)
-            slots = data.get("slots", []) if isinstance(data, dict) else []
-            degraded = bool(data.get("degraded", False)) if isinstance(data, dict) else False
-            if degraded:
-                reason = str(data.get("degraded_reason", "calendar temporarily unavailable"))
-                logger.warning(
-                    "[TOOL check_availability] degraded response; avoiding slot offer. reason=%s",
-                    reason,
-                )
-                return (
-                    "I cannot confirm live calendar availability right now. "
-                    "Please tell me your preferred day and time within the next two weeks, "
-                    "and our team will confirm it right after this call."
-                )
-            if not slots:
-                return (
-                    "I could not find free slots in the next two weeks. "
-                    "Our team will follow up after this call."
-                )
+            data = await _post_json_and_read("/tools/check-meeting-slot", payload)
+            status = str(data.get("status", "")) if isinstance(data, dict) else ""
 
-            lines: list[str] = []
-            for idx, slot in enumerate(slots[:3], start=1):
-                spoken = _format_slot_for_voice(slot)
+            if status == "free":
+                confirmed = data.get("confirmed_slot", {}) if isinstance(data, dict) else {}
+                spoken = _format_slot_for_voice(confirmed) if isinstance(confirmed, dict) else ""
                 if spoken:
-                    lines.append(f"{idx}) {spoken}")
+                    return f"That time is available. We can confirm: {spoken}."
+                return "That time is available. We can confirm it."
 
-            if not lines:
-                return "I found availability but could not format the slots right now."
+            if status in ("busy", "outside_hours"):
+                next_slots = data.get("next_slots", []) if isinstance(data, dict) else []
+                lines: list[str] = []
+                for idx, slot in enumerate(next_slots[:3], start=1):
+                    spoken = _format_slot_for_voice(slot)
+                    if spoken:
+                        lines.append(f"{idx}) {spoken}")
+                if lines:
+                    if status == "busy":
+                        return "That time is not available. Next available options are: " + " ; ".join(lines)
+                    return "That time is outside business hours. Available options are: " + " ; ".join(lines)
 
-            return "Here are the next available options: " + " ; ".join(lines)
+                day_blocks = data.get("day_blocks", []) if isinstance(data, dict) else []
+                block_txt = _format_day_blocks_for_voice(day_blocks if isinstance(day_blocks, list) else [])
+                if block_txt:
+                    return "I cannot use that exact time. Available blocks are: " + block_txt
+                return "I cannot use that exact time right now. Please suggest another time in the next two weeks."
+
+            if status == "outside_horizon":
+                return (
+                    "That request is outside the next two weeks. "
+                    "The responsible person will handle it after this call."
+                )
+
+            if status == "unavailable":
+                return (
+                    "I cannot reach live calendar availability right now. "
+                    "Please share your preferred time and our team will confirm after this call."
+                )
+
+            return "Please provide your preferred date and time in the next two weeks."
         except Exception as e:
-            logger.exception("check_availability failed")
-            return f"I could not check the calendar right now: {e}"
+            logger.exception("check_meeting_slot failed")
+            return f"I could not check that slot right now: {e}"
 
     @function_tool
     async def call_end(
