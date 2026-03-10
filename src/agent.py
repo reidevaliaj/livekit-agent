@@ -416,6 +416,8 @@ async def my_agent(ctx: JobContext):
 
     ambience_stop_event = asyncio.Event()
     ambience_task: Optional[asyncio.Task[Any]] = None
+    ambience_pub: Optional[rtc.LocalTrackPublication] = None
+    ambience_track: Optional[rtc.LocalAudioTrack] = None
 
     async def _ambience_loop() -> None:
         ambience_path = Path(AMBIENCE_FILE)
@@ -440,7 +442,11 @@ async def my_agent(ctx: JobContext):
                 out_channels = 1
                 source = rtc.AudioSource(sample_rate=out_rate, num_channels=out_channels)
                 track = rtc.LocalAudioTrack.create_audio_track("office_ambience", source)
-                await ctx.room.local_participant.publish_track(track)
+                publish_opts = rtc.TrackPublishOptions()
+                publish_opts.source = rtc.TrackSource.SOURCE_MICROPHONE
+                nonlocal ambience_pub, ambience_track
+                ambience_pub = await ctx.room.local_participant.publish_track(track, publish_opts)
+                ambience_track = track
                 logger.info(
                     "[AMBIENCE] started loop file=%s in_rate=%s out_rate=%s in_channels=%s out_channels=%s gain=%.2f",
                     ambience_path,
@@ -510,6 +516,12 @@ async def my_agent(ctx: JobContext):
                 pass
             except Exception:
                 logger.exception("[AMBIENCE] cleanup failed")
+        try:
+            if ambience_pub is not None:
+                await ctx.room.local_participant.unpublish_track(ambience_pub.sid)
+                logger.info("[AMBIENCE] unpublished track sid=%s", ambience_pub.sid)
+        except Exception:
+            logger.exception("[AMBIENCE] unpublish failed")
 
         try:
             payload = _build_transcript_payload(
