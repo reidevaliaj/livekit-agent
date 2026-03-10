@@ -2,6 +2,7 @@
 import time
 import logging
 import asyncio
+import random
 from datetime import datetime, timedelta, timezone
 from typing import Optional, Dict, Any
 from zoneinfo import ZoneInfo
@@ -37,6 +38,16 @@ load_dotenv(".env.local")
 FASTAPI_BASE_URL = os.getenv("FASTAPI_BASE_URL", "https://voice.code-studio.eu")
 TENANT_ID = os.getenv("TENANT_ID", "codestudio")
 BUSINESS_TIMEZONE = os.getenv("BUSINESS_TIMEZONE", "Europe/Budapest")
+
+ENABLE_FILLER_BRIDGE = os.getenv("ENABLE_FILLER_BRIDGE", "true").strip().lower() == "true"
+FILLER_DELAY_SECONDS = float(os.getenv("FILLER_DELAY_SECONDS", "1.5").strip() or "1.5")
+FILLER_PHRASES = [
+    p.strip()
+    for p in os.getenv("FILLER_PHRASES", "Alright.,Okay.,Sure.,One moment.").split(",")
+    if p.strip()
+]
+if not FILLER_PHRASES:
+    FILLER_PHRASES = ["Alright.", "Okay.", "Sure.", "One moment."]
 
 
 def _best_effort_caller_id(room: rtc.Room) -> Optional[str]:
@@ -106,16 +117,21 @@ def _flatten_message_content(content: Any) -> str:
     return str(content)
 
 
+def _history_messages(session: AgentSession) -> list[Any]:
+    messages = (
+        session.history.messages()
+        if callable(getattr(session.history, "messages", None))
+        else session.history.messages
+    )
+    return list(messages or [])
+
+
 def _build_transcript_payload(
     session: AgentSession, room: rtc.Room, shutdown_reason: str
 ) -> Dict[str, Any]:
     messages: list[Dict[str, Any]] = []
     lines: list[str] = []
-    history_messages = (
-        session.history.messages()
-        if callable(getattr(session.history, "messages", None))
-        else session.history.messages
-    )
+    history_messages = _history_messages(session)
     for msg in history_messages:
         if msg.role not in ("user", "assistant"):
             continue
@@ -184,12 +200,23 @@ Call types:
 3) Meeting request (wants a call with Rej Aliaj)
 4) Vendor/sales solicitation (caller is trying to sell us a product/service)
 
+Our services (only these):
+- Web Design
+- WordPress, TYPO3, Shopify
+- Headless CMS
+- Web applications
+- AI integration and agents creation
+- SEO
+
 Rules:
 - Speak in a warm, business-professional tone.
 - Keep responses short (phone style).
 - Ask only the needed questions.
 - Do not promise prices or timelines.
 - If sales lead: capture name, company, need, best email/phone.
+- If caller shows interest in any of our services:
+  give brief, receptionist-level information only, then guide them toward scheduling a meeting with Founder Rey.
+  Do not go into deep technical detail.
 - If support: capture name, company, problem, best contact.
 - When collecting email:
   1) ask caller to spell it slowly if needed,
@@ -317,7 +344,18 @@ Call context:
                 "timestamp": int(time.time()),
             }
             await _post_json("/events/call-end", payload)
-            return "Saved. I sent the details to the team."
+            # Explicitly end the live call once details are saved.
+            try:
+                await ctx.room.disconnect()
+                logger.info("[CALL_END_TOOL] room disconnected after call_end room=%s", room.name if room else None)
+            except Exception:
+                logger.exception("[CALL_END_TOOL] room.disconnect failed; trying shutdown")
+                try:
+                    ctx.shutdown(reason="call_end tool completed")
+                    logger.info("[CALL_END_TOOL] ctx.shutdown called")
+                except Exception:
+                    logger.exception("[CALL_END_TOOL] ctx.shutdown failed")
+            return "Saved. I sent the details to the team. Ending the call now."
         except Exception as e:
             logger.exception("call_end failed")
             return f"Failed to send details: {e}"
@@ -374,8 +412,78 @@ async def my_agent(ctx: JobContext):
         ),
     )
 
+    filler_stop_event = asyncio.Event()
+    filler_task: Optional[asyncio.Task[Any]] = None
+
+    if ENABLE_FILLER_BRIDGE:
+        async def _filler_bridge_watchdog() -> None:
+            last_user_key: Optional[tuple[float, str]] = None
+            filler_sent_for_turn = False
+            while not filler_stop_event.is_set():
+                try:
+                    messages = _history_messages(session)
+                    latest_user = None
+                    for msg in messages:
+                        if getattr(msg, "role", None) == "user":
+                            latest_user = msg
+
+                    if latest_user is None:
+                        await asyncio.sleep(0.1)
+                        continue
+
+                    user_ts = float(getattr(latest_user, "created_at", 0.0) or 0.0)
+                    user_text = _flatten_message_content(getattr(latest_user, "content", "")).strip()
+                    user_key = (user_ts, user_text)
+
+                    if user_key != last_user_key:
+                        last_user_key = user_key
+                        filler_sent_for_turn = False
+
+                    if not filler_sent_for_turn and user_ts > 0 and (time.time() - user_ts) >= FILLER_DELAY_SECONDS:
+                        assistant_after_user = False
+                        for msg in messages:
+                            if getattr(msg, "role", None) != "assistant":
+                                continue
+                            assistant_ts = float(getattr(msg, "created_at", 0.0) or 0.0)
+                            if assistant_ts >= user_ts:
+                                assistant_after_user = True
+                                break
+
+                        if not assistant_after_user:
+                            phrase = random.choice(FILLER_PHRASES)
+                            logger.info(
+                                "[FILLER] bridge phrase room=%s phrase=%s",
+                                ctx.room.name,
+                                phrase,
+                            )
+                            try:
+                                await session.say(phrase)
+                            except Exception:
+                                logger.exception("[FILLER] failed to say bridge phrase")
+                            filler_sent_for_turn = True
+
+                    await asyncio.sleep(0.1)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    logger.exception("[FILLER] watchdog failed")
+                    await asyncio.sleep(0.2)
+
+        filler_task = asyncio.create_task(_filler_bridge_watchdog())
+
     async def _send_transcript_on_shutdown(reason: str) -> None:
         logger.info("[CALL_END] shutdown callback fired room=%s reason=%s", ctx.room.name, reason)
+
+        filler_stop_event.set()
+        if filler_task and not filler_task.done():
+            filler_task.cancel()
+            try:
+                await filler_task
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                logger.exception("[FILLER] cleanup failed")
+
         try:
             payload = _build_transcript_payload(
                 session=session, room=ctx.room, shutdown_reason=reason
@@ -408,7 +516,3 @@ async def my_agent(ctx: JobContext):
 
 if __name__ == "__main__":
     cli.run_app(server)
-
-
-
-
