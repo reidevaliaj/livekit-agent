@@ -3,10 +3,11 @@ import time
 import logging
 import asyncio
 import random
+import audioop
 import wave
 from datetime import datetime, timedelta, timezone
-from typing import Optional, Dict, Any
 from pathlib import Path
+from typing import Optional, Dict, Any
 from zoneinfo import ZoneInfo
 
 import httpx
@@ -41,7 +42,8 @@ FASTAPI_BASE_URL = os.getenv("FASTAPI_BASE_URL", "https://voice.code-studio.eu")
 TENANT_ID = os.getenv("TENANT_ID", "codestudio")
 BUSINESS_TIMEZONE = os.getenv("BUSINESS_TIMEZONE", "Europe/Budapest")
 
-ENABLE_FILLER_BRIDGE = os.getenv("ENABLE_FILLER_BRIDGE", "true").strip().lower() == "true"
+# Filler bridge words are disabled by default due side effects in production.
+ENABLE_FILLER_BRIDGE = os.getenv("ENABLE_FILLER_BRIDGE", "false").strip().lower() == "true"
 FILLER_DELAY_SECONDS = float(os.getenv("FILLER_DELAY_SECONDS", "1.0").strip() or "1.0")
 FILLER_MAX_PER_CALL = int(os.getenv("FILLER_MAX_PER_CALL", "3").strip() or "3")
 FILLER_PHRASES = [
@@ -350,6 +352,7 @@ Call context:
                 "timestamp": int(time.time()),
             }
             await _post_json("/events/call-end", payload)
+
             # Explicitly end the live call once details are saved.
             try:
                 await ctx.room.disconnect()
@@ -361,6 +364,7 @@ Call context:
                     logger.info("[CALL_END_TOOL] ctx.shutdown called")
                 except Exception:
                     logger.exception("[CALL_END_TOOL] ctx.shutdown failed")
+
             return "Saved. I sent the details to the team. Ending the call now."
         except Exception as e:
             logger.exception("call_end failed")
@@ -431,7 +435,7 @@ async def my_agent(ctx: JobContext):
             try:
                 with wave.open(str(ambience_path), "rb") as wf:
                     sample_rate = wf.getframerate()
-                    num_channels = wf.getnchannels()
+                    raw_channels = wf.getnchannels()
                     sample_width = wf.getsampwidth()
                     if sample_width != 2:
                         logger.warning(
@@ -441,14 +445,16 @@ async def my_agent(ctx: JobContext):
                         )
                         return
 
-                    source = rtc.AudioSource(sample_rate=sample_rate, num_channels=num_channels)
+                    out_channels = 1
+                    source = rtc.AudioSource(sample_rate=sample_rate, num_channels=out_channels)
                     track = rtc.LocalAudioTrack.create_audio_track("office_ambience", source)
                     await ctx.room.local_participant.publish_track(track)
                     logger.info(
-                        "[AMBIENCE] started loop file=%s sample_rate=%s channels=%s",
+                        "[AMBIENCE] started loop file=%s sample_rate=%s in_channels=%s out_channels=%s",
                         ambience_path,
                         sample_rate,
-                        num_channels,
+                        raw_channels,
+                        out_channels,
                     )
 
                     frame_samples = max(1, sample_rate // 50)  # ~20ms chunks
@@ -458,14 +464,17 @@ async def my_agent(ctx: JobContext):
                             wf.rewind()
                             continue
 
-                        samples_per_channel = len(pcm) // (2 * num_channels)
+                        if raw_channels > 1:
+                            pcm = audioop.tomono(pcm, sample_width, 0.5, 0.5)
+
+                        samples_per_channel = len(pcm) // (2 * out_channels)
                         if samples_per_channel <= 0:
                             continue
 
                         frame = rtc.AudioFrame(
                             data=pcm,
                             sample_rate=sample_rate,
-                            num_channels=num_channels,
+                            num_channels=out_channels,
                             samples_per_channel=samples_per_channel,
                         )
                         await source.capture_frame(frame)
@@ -474,8 +483,6 @@ async def my_agent(ctx: JobContext):
                 raise
             except Exception:
                 logger.exception("[AMBIENCE] loop failed")
-
-        ambience_task = asyncio.create_task(_ambience_loop())
 
     filler_stop_event = asyncio.Event()
     filler_task: Optional[asyncio.Task[Any]] = None
@@ -502,7 +509,6 @@ async def my_agent(ctx: JobContext):
                         continue
 
                     latest_user = latest_msg
-
                     user_ts = float(getattr(latest_user, "created_at", 0.0) or 0.0)
                     user_text = _flatten_message_content(getattr(latest_user, "content", "")).strip()
                     user_key = (user_ts, user_text)
@@ -511,7 +517,11 @@ async def my_agent(ctx: JobContext):
                         last_user_key = user_key
                         filler_sent_for_turn = False
 
-                    if not filler_sent_for_turn and user_ts > 0 and (time.time() - user_ts) >= FILLER_DELAY_SECONDS:
+                    if (
+                        not filler_sent_for_turn
+                        and user_ts > 0
+                        and (time.time() - user_ts) >= FILLER_DELAY_SECONDS
+                    ):
                         assistant_after_user = False
                         for msg in messages:
                             if getattr(msg, "role", None) != "assistant":
@@ -593,8 +603,11 @@ async def my_agent(ctx: JobContext):
     ctx.add_shutdown_callback(_send_transcript_on_shutdown)
 
     await ctx.connect()
-    await asyncio.sleep(0.5)
-    await session.say("Thanks for calling Code Studio How may we help you today?")
+    if ENABLE_AMBIENCE_LOOP:
+        ambience_task = asyncio.create_task(_ambience_loop())
+
+    await asyncio.sleep(0.3)
+    await session.say("Thanks for calling Code Studio. How may we help you today?")
 
 
 if __name__ == "__main__":
