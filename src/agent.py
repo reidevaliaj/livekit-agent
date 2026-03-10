@@ -1,5 +1,6 @@
 ﻿import os
 import time
+import json
 import logging
 import asyncio
 import audioop
@@ -48,6 +49,13 @@ ENABLE_AMBIENCE_LOOP = os.getenv("ENABLE_AMBIENCE_LOOP", "true").strip().lower()
 AMBIENCE_FILE = os.getenv("AMBIENCE_FILE", str(Path(__file__).parent / "assets" / "ambience_office.wav"))
 AMBIENCE_OUTPUT_SAMPLE_RATE = int(os.getenv("AMBIENCE_OUTPUT_SAMPLE_RATE", "8000").strip() or "8000")
 AMBIENCE_GAIN = float(os.getenv("AMBIENCE_GAIN", "1.6").strip() or "1.6")
+AMBIENCE_DEBUG_FILE = os.getenv(
+    "AMBIENCE_DEBUG_FILE",
+    str(Path(__file__).parent / "assets" / "ambience_debug.jsonl"),
+)
+AMBIENCE_LOG_HEARTBEAT_SEC = float(
+    os.getenv("AMBIENCE_LOG_HEARTBEAT_SEC", "5").strip() or "5"
+)
 
 
 def _best_effort_caller_id(room: rtc.Room) -> Optional[str]:
@@ -418,23 +426,67 @@ async def my_agent(ctx: JobContext):
     ambience_task: Optional[asyncio.Task[Any]] = None
     ambience_pub: Optional[rtc.LocalTrackPublication] = None
     ambience_track: Optional[rtc.LocalAudioTrack] = None
+    ambience_debug_file = Path(AMBIENCE_DEBUG_FILE)
+
+    def _ambience_debug(event: str, **fields: Any) -> None:
+        payload: Dict[str, Any] = {
+            "event": event,
+            "ts_unix": round(time.time(), 3),
+            "ts_iso": datetime.now(timezone.utc).isoformat(),
+            "room": ctx.room.name,
+            "job_id": getattr(getattr(ctx, "job", None), "id", None),
+            "file": str(ambience_debug_file),
+        }
+        payload.update(fields)
+        try:
+            ambience_debug_file.parent.mkdir(parents=True, exist_ok=True)
+            with ambience_debug_file.open("a", encoding="utf-8") as fh:
+                fh.write(json.dumps(payload, ensure_ascii=True) + "\n")
+        except Exception:
+            logger.exception(
+                "[AMBIENCE] failed to write debug event=%s file=%s",
+                event,
+                ambience_debug_file,
+            )
 
     async def _ambience_loop() -> None:
         ambience_path = Path(AMBIENCE_FILE)
+        _ambience_debug(
+            "loop_enter",
+            ambience_file=str(ambience_path),
+            enabled=ENABLE_AMBIENCE_LOOP,
+        )
         if not ambience_path.exists():
             logger.warning("[AMBIENCE] file not found: %s", ambience_path)
+            _ambience_debug("file_not_found", ambience_file=str(ambience_path))
             return
 
+        frames_sent = 0
+        rewinds = 0
+        samples_total = 0
+        first_frame_logged = False
+        last_heartbeat_ts = time.monotonic()
         try:
             with wave.open(str(ambience_path), "rb") as wf:
                 in_rate = wf.getframerate()
                 in_channels = wf.getnchannels()
                 sample_width = wf.getsampwidth()
+                _ambience_debug(
+                    "file_opened",
+                    in_rate=in_rate,
+                    in_channels=in_channels,
+                    sample_width=sample_width,
+                )
                 if sample_width != 2:
                     logger.warning(
                         "[AMBIENCE] unsupported sample width=%s in %s (expected 16-bit PCM)",
                         sample_width,
                         ambience_path,
+                    )
+                    _ambience_debug(
+                        "unsupported_format",
+                        sample_width=sample_width,
+                        expected=2,
                     )
                     return
 
@@ -447,6 +499,16 @@ async def my_agent(ctx: JobContext):
                 nonlocal ambience_pub, ambience_track
                 ambience_pub = await ctx.room.local_participant.publish_track(track, publish_opts)
                 ambience_track = track
+                _ambience_debug(
+                    "track_published",
+                    track_name="office_ambience",
+                    track_sid=getattr(ambience_pub, "sid", None),
+                    in_rate=in_rate,
+                    out_rate=out_rate,
+                    in_channels=in_channels,
+                    out_channels=out_channels,
+                    gain=AMBIENCE_GAIN,
+                )
                 logger.info(
                     "[AMBIENCE] started loop file=%s in_rate=%s out_rate=%s in_channels=%s out_channels=%s gain=%.2f",
                     ambience_path,
@@ -466,6 +528,13 @@ async def my_agent(ctx: JobContext):
                     if not pcm:
                         wf.rewind()
                         rate_state = None
+                        rewinds += 1
+                        _ambience_debug(
+                            "rewind",
+                            rewinds=rewinds,
+                            frames_sent=frames_sent,
+                            seconds_sent=round(samples_total / out_rate, 3),
+                        )
                         continue
 
                     if in_channels > 1:
@@ -489,6 +558,7 @@ async def my_agent(ctx: JobContext):
 
                     samples_per_channel = len(pcm) // (2 * out_channels)
                     if samples_per_channel <= 0:
+                        _ambience_debug("zero_sample_frame")
                         continue
 
                     frame = rtc.AudioFrame(
@@ -498,14 +568,60 @@ async def my_agent(ctx: JobContext):
                         samples_per_channel=samples_per_channel,
                     )
                     await source.capture_frame(frame)
+                    frames_sent += 1
+                    samples_total += samples_per_channel
+                    if not first_frame_logged:
+                        first_frame_logged = True
+                        _ambience_debug(
+                            "first_frame_sent",
+                            samples_per_channel=samples_per_channel,
+                            bytes=len(pcm),
+                        )
+                    now_ts = time.monotonic()
+                    if now_ts - last_heartbeat_ts >= AMBIENCE_LOG_HEARTBEAT_SEC:
+                        _ambience_debug(
+                            "heartbeat",
+                            frames_sent=frames_sent,
+                            rewinds=rewinds,
+                            seconds_sent=round(samples_total / out_rate, 3),
+                            last_samples_per_channel=samples_per_channel,
+                        )
+                        last_heartbeat_ts = now_ts
                     await asyncio.sleep(samples_per_channel / out_rate)
         except asyncio.CancelledError:
+            _ambience_debug(
+                "loop_cancelled",
+                frames_sent=frames_sent,
+                rewinds=rewinds,
+                seconds_sent=round(samples_total / max(1, AMBIENCE_OUTPUT_SAMPLE_RATE), 3),
+            )
             raise
-        except Exception:
+        except Exception as exc:
+            _ambience_debug(
+                "loop_error",
+                error=str(exc),
+                frames_sent=frames_sent,
+                rewinds=rewinds,
+                seconds_sent=round(samples_total / max(1, AMBIENCE_OUTPUT_SAMPLE_RATE), 3),
+            )
             logger.exception("[AMBIENCE] loop failed")
+        finally:
+            _ambience_debug(
+                "loop_exit",
+                frames_sent=frames_sent,
+                rewinds=rewinds,
+                seconds_sent=round(samples_total / max(1, AMBIENCE_OUTPUT_SAMPLE_RATE), 3),
+            )
 
     async def _send_transcript_on_shutdown(reason: str) -> None:
         logger.info("[CALL_END] shutdown callback fired room=%s reason=%s", ctx.room.name, reason)
+        _ambience_debug(
+            "shutdown_start",
+            reason=reason,
+            task_exists=ambience_task is not None,
+            task_done=(ambience_task.done() if ambience_task else None),
+            track_sid=(ambience_pub.sid if ambience_pub else None),
+        )
 
         ambience_stop_event.set()
         if ambience_task and not ambience_task.done():
@@ -513,14 +629,18 @@ async def my_agent(ctx: JobContext):
             try:
                 await ambience_task
             except asyncio.CancelledError:
+                _ambience_debug("task_cancelled")
                 pass
             except Exception:
+                _ambience_debug("cleanup_error")
                 logger.exception("[AMBIENCE] cleanup failed")
         try:
             if ambience_pub is not None:
                 await ctx.room.local_participant.unpublish_track(ambience_pub.sid)
                 logger.info("[AMBIENCE] unpublished track sid=%s", ambience_pub.sid)
+                _ambience_debug("track_unpublished", track_sid=ambience_pub.sid)
         except Exception:
+            _ambience_debug("unpublish_error")
             logger.exception("[AMBIENCE] unpublish failed")
 
         try:
@@ -549,9 +669,18 @@ async def my_agent(ctx: JobContext):
     ctx.add_shutdown_callback(_send_transcript_on_shutdown)
 
     await ctx.connect()
+    _ambience_debug(
+        "call_connected",
+        ambience_enabled=ENABLE_AMBIENCE_LOOP,
+        ambience_file=str(Path(AMBIENCE_FILE)),
+        debug_file=str(ambience_debug_file),
+    )
 
     if ENABLE_AMBIENCE_LOOP:
         ambience_task = asyncio.create_task(_ambience_loop())
+        _ambience_debug("task_created")
+    else:
+        _ambience_debug("disabled")
 
     await asyncio.sleep(0.3)
     await session.say("Thanks for calling Code Studio. How may we help you today?")
