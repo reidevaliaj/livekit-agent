@@ -2,7 +2,6 @@
 import time
 import logging
 import asyncio
-import random
 import audioop
 import wave
 from datetime import datetime, timedelta, timezone
@@ -42,20 +41,13 @@ FASTAPI_BASE_URL = os.getenv("FASTAPI_BASE_URL", "https://voice.code-studio.eu")
 TENANT_ID = os.getenv("TENANT_ID", "codestudio")
 BUSINESS_TIMEZONE = os.getenv("BUSINESS_TIMEZONE", "Europe/Budapest")
 
-# Filler bridge words are disabled by default due side effects in production.
-ENABLE_FILLER_BRIDGE = os.getenv("ENABLE_FILLER_BRIDGE", "false").strip().lower() == "true"
-FILLER_DELAY_SECONDS = float(os.getenv("FILLER_DELAY_SECONDS", "1.0").strip() or "1.0")
-FILLER_MAX_PER_CALL = int(os.getenv("FILLER_MAX_PER_CALL", "3").strip() or "3")
-FILLER_PHRASES = [
-    p.strip()
-    for p in os.getenv("FILLER_PHRASES", "Alright.,Okay.,Sure.").split(",")
-    if p.strip()
-]
-if not FILLER_PHRASES:
-    FILLER_PHRASES = ["Alright.", "Okay.", "Sure."]
+# Filler bridge removed on purpose to avoid false triggers and extra TTS load.
+ENABLE_FILLER_BRIDGE = False
 
 ENABLE_AMBIENCE_LOOP = os.getenv("ENABLE_AMBIENCE_LOOP", "true").strip().lower() == "true"
 AMBIENCE_FILE = os.getenv("AMBIENCE_FILE", str(Path(__file__).parent / "assets" / "ambience_office.wav"))
+AMBIENCE_OUTPUT_SAMPLE_RATE = int(os.getenv("AMBIENCE_OUTPUT_SAMPLE_RATE", "8000").strip() or "8000")
+AMBIENCE_GAIN = float(os.getenv("AMBIENCE_GAIN", "1.6").strip() or "1.6")
 
 
 def _best_effort_caller_id(room: rtc.Room) -> Optional[str]:
@@ -425,134 +417,86 @@ async def my_agent(ctx: JobContext):
     ambience_stop_event = asyncio.Event()
     ambience_task: Optional[asyncio.Task[Any]] = None
 
-    if ENABLE_AMBIENCE_LOOP:
-        async def _ambience_loop() -> None:
-            ambience_path = Path(AMBIENCE_FILE)
-            if not ambience_path.exists():
-                logger.warning("[AMBIENCE] file not found: %s", ambience_path)
-                return
+    async def _ambience_loop() -> None:
+        ambience_path = Path(AMBIENCE_FILE)
+        if not ambience_path.exists():
+            logger.warning("[AMBIENCE] file not found: %s", ambience_path)
+            return
 
-            try:
-                with wave.open(str(ambience_path), "rb") as wf:
-                    sample_rate = wf.getframerate()
-                    raw_channels = wf.getnchannels()
-                    sample_width = wf.getsampwidth()
-                    if sample_width != 2:
-                        logger.warning(
-                            "[AMBIENCE] unsupported sample width=%s in %s (expected 16-bit PCM)",
-                            sample_width,
-                            ambience_path,
-                        )
-                        return
-
-                    out_channels = 1
-                    source = rtc.AudioSource(sample_rate=sample_rate, num_channels=out_channels)
-                    track = rtc.LocalAudioTrack.create_audio_track("office_ambience", source)
-                    await ctx.room.local_participant.publish_track(track)
-                    logger.info(
-                        "[AMBIENCE] started loop file=%s sample_rate=%s in_channels=%s out_channels=%s",
+        try:
+            with wave.open(str(ambience_path), "rb") as wf:
+                in_rate = wf.getframerate()
+                in_channels = wf.getnchannels()
+                sample_width = wf.getsampwidth()
+                if sample_width != 2:
+                    logger.warning(
+                        "[AMBIENCE] unsupported sample width=%s in %s (expected 16-bit PCM)",
+                        sample_width,
                         ambience_path,
-                        sample_rate,
-                        raw_channels,
-                        out_channels,
                     )
+                    return
 
-                    frame_samples = max(1, sample_rate // 50)  # ~20ms chunks
-                    while not ambience_stop_event.is_set():
-                        pcm = wf.readframes(frame_samples)
-                        if not pcm:
-                            wf.rewind()
-                            continue
+                out_rate = AMBIENCE_OUTPUT_SAMPLE_RATE
+                out_channels = 1
+                source = rtc.AudioSource(sample_rate=out_rate, num_channels=out_channels)
+                track = rtc.LocalAudioTrack.create_audio_track("office_ambience", source)
+                await ctx.room.local_participant.publish_track(track)
+                logger.info(
+                    "[AMBIENCE] started loop file=%s in_rate=%s out_rate=%s in_channels=%s out_channels=%s gain=%.2f",
+                    ambience_path,
+                    in_rate,
+                    out_rate,
+                    in_channels,
+                    out_channels,
+                    AMBIENCE_GAIN,
+                )
 
-                        if raw_channels > 1:
-                            pcm = audioop.tomono(pcm, sample_width, 0.5, 0.5)
+                frame_duration_sec = 0.02
+                in_frame_samples = max(1, int(in_rate * frame_duration_sec))
+                rate_state = None
 
-                        samples_per_channel = len(pcm) // (2 * out_channels)
-                        if samples_per_channel <= 0:
-                            continue
+                while not ambience_stop_event.is_set():
+                    pcm = wf.readframes(in_frame_samples)
+                    if not pcm:
+                        wf.rewind()
+                        rate_state = None
+                        continue
 
-                        frame = rtc.AudioFrame(
-                            data=pcm,
-                            sample_rate=sample_rate,
-                            num_channels=out_channels,
-                            samples_per_channel=samples_per_channel,
+                    if in_channels > 1:
+                        pcm = audioop.tomono(pcm, sample_width, 0.5, 0.5)
+
+                    if AMBIENCE_GAIN != 1.0:
+                        try:
+                            pcm = audioop.mul(pcm, sample_width, AMBIENCE_GAIN)
+                        except Exception:
+                            pass
+
+                    if in_rate != out_rate:
+                        pcm, rate_state = audioop.ratecv(
+                            pcm,
+                            sample_width,
+                            out_channels,
+                            in_rate,
+                            out_rate,
+                            rate_state,
                         )
-                        await source.capture_frame(frame)
-                        await asyncio.sleep(samples_per_channel / sample_rate)
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                logger.exception("[AMBIENCE] loop failed")
 
-    filler_stop_event = asyncio.Event()
-    filler_task: Optional[asyncio.Task[Any]] = None
-
-    if ENABLE_FILLER_BRIDGE:
-        async def _filler_bridge_watchdog() -> None:
-            last_user_key: Optional[tuple[float, str]] = None
-            filler_sent_for_turn = False
-            filler_count = 0
-            while not filler_stop_event.is_set():
-                try:
-                    if filler_count >= FILLER_MAX_PER_CALL:
-                        await asyncio.sleep(0.2)
+                    samples_per_channel = len(pcm) // (2 * out_channels)
+                    if samples_per_channel <= 0:
                         continue
 
-                    messages = _history_messages(session)
-                    if not messages:
-                        await asyncio.sleep(0.1)
-                        continue
-
-                    latest_msg = messages[-1]
-                    if getattr(latest_msg, "role", None) != "user":
-                        await asyncio.sleep(0.1)
-                        continue
-
-                    latest_user = latest_msg
-                    user_ts = float(getattr(latest_user, "created_at", 0.0) or 0.0)
-                    user_text = _flatten_message_content(getattr(latest_user, "content", "")).strip()
-                    user_key = (user_ts, user_text)
-
-                    if user_key != last_user_key:
-                        last_user_key = user_key
-                        filler_sent_for_turn = False
-
-                    if (
-                        not filler_sent_for_turn
-                        and user_ts > 0
-                        and (time.time() - user_ts) >= FILLER_DELAY_SECONDS
-                    ):
-                        assistant_after_user = False
-                        for msg in messages:
-                            if getattr(msg, "role", None) != "assistant":
-                                continue
-                            assistant_ts = float(getattr(msg, "created_at", 0.0) or 0.0)
-                            if assistant_ts >= user_ts:
-                                assistant_after_user = True
-                                break
-
-                        if not assistant_after_user:
-                            phrase = random.choice(FILLER_PHRASES)
-                            logger.info(
-                                "[FILLER] bridge phrase room=%s phrase=%s",
-                                ctx.room.name,
-                                phrase,
-                            )
-                            try:
-                                await session.say(phrase)
-                            except Exception:
-                                logger.exception("[FILLER] failed to say bridge phrase")
-                            filler_sent_for_turn = True
-                            filler_count += 1
-
-                    await asyncio.sleep(0.1)
-                except asyncio.CancelledError:
-                    raise
-                except Exception:
-                    logger.exception("[FILLER] watchdog failed")
-                    await asyncio.sleep(0.2)
-
-        filler_task = asyncio.create_task(_filler_bridge_watchdog())
+                    frame = rtc.AudioFrame(
+                        data=pcm,
+                        sample_rate=out_rate,
+                        num_channels=out_channels,
+                        samples_per_channel=samples_per_channel,
+                    )
+                    await source.capture_frame(frame)
+                    await asyncio.sleep(samples_per_channel / out_rate)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("[AMBIENCE] loop failed")
 
     async def _send_transcript_on_shutdown(reason: str) -> None:
         logger.info("[CALL_END] shutdown callback fired room=%s reason=%s", ctx.room.name, reason)
@@ -566,16 +510,6 @@ async def my_agent(ctx: JobContext):
                 pass
             except Exception:
                 logger.exception("[AMBIENCE] cleanup failed")
-
-        filler_stop_event.set()
-        if filler_task and not filler_task.done():
-            filler_task.cancel()
-            try:
-                await filler_task
-            except asyncio.CancelledError:
-                pass
-            except Exception:
-                logger.exception("[FILLER] cleanup failed")
 
         try:
             payload = _build_transcript_payload(
@@ -603,6 +537,7 @@ async def my_agent(ctx: JobContext):
     ctx.add_shutdown_callback(_send_transcript_on_shutdown)
 
     await ctx.connect()
+
     if ENABLE_AMBIENCE_LOOP:
         ambience_task = asyncio.create_task(_ambience_loop())
 
