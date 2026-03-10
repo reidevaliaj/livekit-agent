@@ -3,8 +3,10 @@ import time
 import logging
 import asyncio
 import random
+import wave
 from datetime import datetime, timedelta, timezone
 from typing import Optional, Dict, Any
+from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import httpx
@@ -40,14 +42,18 @@ TENANT_ID = os.getenv("TENANT_ID", "codestudio")
 BUSINESS_TIMEZONE = os.getenv("BUSINESS_TIMEZONE", "Europe/Budapest")
 
 ENABLE_FILLER_BRIDGE = os.getenv("ENABLE_FILLER_BRIDGE", "true").strip().lower() == "true"
-FILLER_DELAY_SECONDS = float(os.getenv("FILLER_DELAY_SECONDS", "1.5").strip() or "1.5")
+FILLER_DELAY_SECONDS = float(os.getenv("FILLER_DELAY_SECONDS", "1.0").strip() or "1.0")
+FILLER_MAX_PER_CALL = int(os.getenv("FILLER_MAX_PER_CALL", "3").strip() or "3")
 FILLER_PHRASES = [
     p.strip()
-    for p in os.getenv("FILLER_PHRASES", "Alright.,Okay.,Sure.,One moment.").split(",")
+    for p in os.getenv("FILLER_PHRASES", "Alright.,Okay.,Sure.").split(",")
     if p.strip()
 ]
 if not FILLER_PHRASES:
-    FILLER_PHRASES = ["Alright.", "Okay.", "Sure.", "One moment."]
+    FILLER_PHRASES = ["Alright.", "Okay.", "Sure."]
+
+ENABLE_AMBIENCE_LOOP = os.getenv("ENABLE_AMBIENCE_LOOP", "true").strip().lower() == "true"
+AMBIENCE_FILE = os.getenv("AMBIENCE_FILE", str(Path(__file__).parent / "assets" / "ambience_office.wav"))
 
 
 def _best_effort_caller_id(room: rtc.Room) -> Optional[str]:
@@ -412,6 +418,65 @@ async def my_agent(ctx: JobContext):
         ),
     )
 
+    ambience_stop_event = asyncio.Event()
+    ambience_task: Optional[asyncio.Task[Any]] = None
+
+    if ENABLE_AMBIENCE_LOOP:
+        async def _ambience_loop() -> None:
+            ambience_path = Path(AMBIENCE_FILE)
+            if not ambience_path.exists():
+                logger.warning("[AMBIENCE] file not found: %s", ambience_path)
+                return
+
+            try:
+                with wave.open(str(ambience_path), "rb") as wf:
+                    sample_rate = wf.getframerate()
+                    num_channels = wf.getnchannels()
+                    sample_width = wf.getsampwidth()
+                    if sample_width != 2:
+                        logger.warning(
+                            "[AMBIENCE] unsupported sample width=%s in %s (expected 16-bit PCM)",
+                            sample_width,
+                            ambience_path,
+                        )
+                        return
+
+                    source = rtc.AudioSource(sample_rate=sample_rate, num_channels=num_channels)
+                    track = rtc.LocalAudioTrack.create_audio_track("office_ambience", source)
+                    await ctx.room.local_participant.publish_track(track)
+                    logger.info(
+                        "[AMBIENCE] started loop file=%s sample_rate=%s channels=%s",
+                        ambience_path,
+                        sample_rate,
+                        num_channels,
+                    )
+
+                    frame_samples = max(1, sample_rate // 50)  # ~20ms chunks
+                    while not ambience_stop_event.is_set():
+                        pcm = wf.readframes(frame_samples)
+                        if not pcm:
+                            wf.rewind()
+                            continue
+
+                        samples_per_channel = len(pcm) // (2 * num_channels)
+                        if samples_per_channel <= 0:
+                            continue
+
+                        frame = rtc.AudioFrame(
+                            data=pcm,
+                            sample_rate=sample_rate,
+                            num_channels=num_channels,
+                            samples_per_channel=samples_per_channel,
+                        )
+                        await source.capture_frame(frame)
+                        await asyncio.sleep(samples_per_channel / sample_rate)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("[AMBIENCE] loop failed")
+
+        ambience_task = asyncio.create_task(_ambience_loop())
+
     filler_stop_event = asyncio.Event()
     filler_task: Optional[asyncio.Task[Any]] = None
 
@@ -419,17 +484,24 @@ async def my_agent(ctx: JobContext):
         async def _filler_bridge_watchdog() -> None:
             last_user_key: Optional[tuple[float, str]] = None
             filler_sent_for_turn = False
+            filler_count = 0
             while not filler_stop_event.is_set():
                 try:
-                    messages = _history_messages(session)
-                    latest_user = None
-                    for msg in messages:
-                        if getattr(msg, "role", None) == "user":
-                            latest_user = msg
+                    if filler_count >= FILLER_MAX_PER_CALL:
+                        await asyncio.sleep(0.2)
+                        continue
 
-                    if latest_user is None:
+                    messages = _history_messages(session)
+                    if not messages:
                         await asyncio.sleep(0.1)
                         continue
+
+                    latest_msg = messages[-1]
+                    if getattr(latest_msg, "role", None) != "user":
+                        await asyncio.sleep(0.1)
+                        continue
+
+                    latest_user = latest_msg
 
                     user_ts = float(getattr(latest_user, "created_at", 0.0) or 0.0)
                     user_text = _flatten_message_content(getattr(latest_user, "content", "")).strip()
@@ -461,6 +533,7 @@ async def my_agent(ctx: JobContext):
                             except Exception:
                                 logger.exception("[FILLER] failed to say bridge phrase")
                             filler_sent_for_turn = True
+                            filler_count += 1
 
                     await asyncio.sleep(0.1)
                 except asyncio.CancelledError:
@@ -473,6 +546,16 @@ async def my_agent(ctx: JobContext):
 
     async def _send_transcript_on_shutdown(reason: str) -> None:
         logger.info("[CALL_END] shutdown callback fired room=%s reason=%s", ctx.room.name, reason)
+
+        ambience_stop_event.set()
+        if ambience_task and not ambience_task.done():
+            ambience_task.cancel()
+            try:
+                await ambience_task
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                logger.exception("[AMBIENCE] cleanup failed")
 
         filler_stop_event.set()
         if filler_task and not filler_task.done():
@@ -510,8 +593,8 @@ async def my_agent(ctx: JobContext):
     ctx.add_shutdown_callback(_send_transcript_on_shutdown)
 
     await ctx.connect()
-    await asyncio.sleep(0.3)
-    await session.say("Thanks for calling Code Studio. How may we help you today?")
+    await asyncio.sleep(0.5)
+    await session.say("Thanks for calling Code Studio How may we help you today?")
 
 
 if __name__ == "__main__":
