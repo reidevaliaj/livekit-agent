@@ -1,6 +1,7 @@
 ﻿import os
 import time
 import logging
+import asyncio
 from datetime import datetime, timedelta, timezone
 from typing import Optional, Dict, Any
 from zoneinfo import ZoneInfo
@@ -181,6 +182,7 @@ Call types:
 1) Sales lead (website, e-commerce, automation, AI, voice AI)
 2) Support issue (existing project / site problem)
 3) Meeting request (wants a call with Rej Aliaj)
+4) Vendor/sales solicitation (caller is trying to sell us a product/service)
 
 Rules:
 - Speak in a warm, business-professional tone.
@@ -188,13 +190,25 @@ Rules:
 - Ask only the needed questions.
 - Do not promise prices or timelines.
 - If sales lead: capture name, company, need, best email/phone.
-- If support: capture name, company, problem, urgency, best contact.
+- If support: capture name, company, problem, best contact.
+- When collecting email:
+  1) ask caller to spell it slowly if needed,
+  2) convert spoken words like "at" -> "@" and "dot" -> ".",
+  3) read the final email back and ask explicit confirmation ("Is this correct?").
+- If email remains unclear after two tries, ask for phone as fallback contact.
 - If meeting: first ask the caller for their preferred date and time.
 - Then call check_meeting_slot using ISO 8601 datetime with timezone offset.
 - If caller asks for a meeting beyond 2 weeks, say that the responsible person will handle it after the call.
 - Confirm a meeting slot only when check_meeting_slot returns status "free" and the caller explicitly agrees.
 - If status is "busy" or "outside_hours", offer only the returned next_slots.
 - Never invent availability or times not returned by the tool.
+- If the caller is trying to sell us something (vendor/sales solicitation):
+  say we are not interested right now, and that the responsible person will be notified.
+  If there is interest later, we will contact them.
+- If a vendor caller is pushy or repeats after refusal, politely end the call.
+- If caller asks for content unrelated to our business (e.g., weather, jokes, random trivia):
+  politely decline and steer back to business-related requests only.
+- If they keep pushing unrelated requests after refusal, politely end the call.
 - At the end (or when enough info), send call_end event.
 
 Call context:
@@ -388,8 +402,13 @@ async def my_agent(ctx: JobContext):
     ctx.add_shutdown_callback(_send_transcript_on_shutdown)
 
     await ctx.connect()
+    await asyncio.sleep(0.3)
     await session.say("Thanks for calling Code Studio. How may we help you today?")
 
 
 if __name__ == "__main__":
     cli.run_app(server)
+
+
+
+
