@@ -39,6 +39,12 @@ load_dotenv(".env.local")
 FASTAPI_BASE_URL = os.getenv("FASTAPI_BASE_URL", "https://voice.code-studio.eu")
 TENANT_ID = os.getenv("TENANT_ID", "codestudio")
 BUSINESS_TIMEZONE = os.getenv("BUSINESS_TIMEZONE", "Europe/Budapest")
+AGENT_NUM_IDLE_PROCESSES = int(os.getenv("AGENT_NUM_IDLE_PROCESSES", "1").strip() or "1")
+AGENT_LOAD_THRESHOLD = float(os.getenv("AGENT_LOAD_THRESHOLD", "0.92").strip() or "0.92")
+LLM_MODEL = os.getenv("LLM_MODEL", "gpt-4.1-mini").strip() or "gpt-4.1-mini"
+ENABLE_LLM_WARMUP = os.getenv("ENABLE_LLM_WARMUP", "true").strip().lower() == "true"
+LLM_WARMUP_TIMEOUT_SEC = float(os.getenv("LLM_WARMUP_TIMEOUT_SEC", "3.5").strip() or "3.5")
+LLM_WARMUP_MODEL = os.getenv("LLM_WARMUP_MODEL", "gpt-4.1-nano").strip() or "gpt-4.1-nano"
 
 # Filler bridge removed on purpose to avoid false triggers and extra TTS load.
 ENABLE_FILLER_BRIDGE = False
@@ -271,6 +277,48 @@ def _flatten_message_content(content: Any) -> str:
     return str(content)
 
 
+async def _warmup_llm_once() -> None:
+    if not ENABLE_LLM_WARMUP:
+        return
+
+    api_key = (os.getenv("OPENAI_API_KEY") or "").strip()
+    if not api_key:
+        logger.warning("[WARMUP] skipped: OPENAI_API_KEY not set")
+        return
+
+    payload = {
+        "model": LLM_WARMUP_MODEL,
+        "messages": [{"role": "system", "content": "Respond with exactly: ok"}],
+        "max_completion_tokens": 1,
+        "temperature": 0,
+    }
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+    timeout = httpx.Timeout(LLM_WARMUP_TIMEOUT_SEC, connect=2.0)
+    started = time.monotonic()
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            response = await client.post(
+                "https://api.openai.com/v1/chat/completions",
+                json=payload,
+                headers=headers,
+            )
+            response.raise_for_status()
+        logger.info(
+            "[WARMUP] LLM warmup done model=%s elapsed=%.3fs",
+            LLM_WARMUP_MODEL,
+            time.monotonic() - started,
+        )
+    except Exception:
+        logger.exception(
+            "[WARMUP] LLM warmup failed model=%s timeout=%.2fs",
+            LLM_WARMUP_MODEL,
+            LLM_WARMUP_TIMEOUT_SEC,
+        )
+
+
 def _history_messages(session: AgentSession) -> list[Any]:
     messages = (
         session.history.messages()
@@ -371,6 +419,7 @@ Our services (only these):
 Rules:
 - Speak in a warm, business-professional tone.
 - Keep responses short (phone style).
+- On the caller's first turn, answer in one short sentence, then ask one focused question.
 - Ask only the needed questions.
 - Do not promise prices or timelines.
 - If sales lead: capture name, company, need, best email/phone.
@@ -534,7 +583,22 @@ Call context:
             return f"Failed to send details: {e}"
 
 
-server = AgentServer()
+try:
+    server = AgentServer(
+        num_idle_processes=AGENT_NUM_IDLE_PROCESSES,
+        load_threshold=AGENT_LOAD_THRESHOLD,
+    )
+    logger.info(
+        "[SERVER] configured num_idle_processes=%s load_threshold=%.2f",
+        AGENT_NUM_IDLE_PROCESSES,
+        AGENT_LOAD_THRESHOLD,
+    )
+except TypeError:
+    # Backward-compatible fallback for older AgentServer signatures.
+    logger.warning(
+        "[SERVER] AgentServer() does not accept num_idle_processes/load_threshold on this SDK; using defaults"
+    )
+    server = AgentServer()
 
 
 def prewarm(proc: JobProcess):
@@ -570,7 +634,7 @@ async def my_agent(ctx: JobContext):
 
     session = AgentSession(
         stt=deepgram.STT(model="nova-3", language="multi"),
-        llm=openai.LLM(model="gpt-4.1-mini"),
+        llm=openai.LLM(model=LLM_MODEL),
         tts=cartesia.TTS(
             model="sonic-3",
             voice="9626c31c-bec5-4cca-baa8-f8ba9e84c8bc",
@@ -775,6 +839,9 @@ async def my_agent(ctx: JobContext):
     ctx.add_shutdown_callback(_send_transcript_on_shutdown)
 
     await ctx.connect()
+
+    if ENABLE_LLM_WARMUP:
+        asyncio.create_task(_warmup_llm_once())
 
     if ENABLE_AMBIENCE_LOOP and not ENABLE_AMBIENCE_TTS_MIX:
         ambience_task = asyncio.create_task(_ambience_loop())
