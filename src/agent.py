@@ -6,7 +6,7 @@ import audioop
 import wave
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, AsyncIterable
 from zoneinfo import ZoneInfo
 
 import httpx
@@ -43,7 +43,8 @@ BUSINESS_TIMEZONE = os.getenv("BUSINESS_TIMEZONE", "Europe/Budapest")
 # Filler bridge removed on purpose to avoid false triggers and extra TTS load.
 ENABLE_FILLER_BRIDGE = False
 
-ENABLE_AMBIENCE_LOOP = os.getenv("ENABLE_AMBIENCE_LOOP", "true").strip().lower() == "true"
+ENABLE_AMBIENCE_LOOP = os.getenv("ENABLE_AMBIENCE_LOOP", "false").strip().lower() == "true"
+ENABLE_AMBIENCE_TTS_MIX = os.getenv("ENABLE_AMBIENCE_TTS_MIX", "true").strip().lower() == "true"
 AMBIENCE_FILE = os.getenv("AMBIENCE_FILE", str(Path(__file__).parent / "assets" / "ambience_office.wav"))
 AMBIENCE_OUTPUT_SAMPLE_RATE = int(os.getenv("AMBIENCE_OUTPUT_SAMPLE_RATE", "8000").strip() or "8000")
 AMBIENCE_GAIN = float(os.getenv("AMBIENCE_GAIN", "1.6").strip() or "1.6")
@@ -65,6 +66,126 @@ def _ambience_track_source() -> rtc.TrackSource:
     if AMBIENCE_TRACK_SOURCE == "camera":
         return rtc.TrackSource.SOURCE_CAMERA
     return rtc.TrackSource.SOURCE_UNKNOWN
+
+
+class _WavAmbienceMixer:
+    def __init__(self, path: str, gain: float = 1.0) -> None:
+        self._path = path
+        self._gain = gain
+        self._cache: Dict[tuple[int, int], bytes] = {}
+        self._positions: Dict[tuple[int, int], int] = {}
+        self._loaded = False
+        self._enabled = False
+        self._sample_width = 2
+        self._in_rate = 0
+        self._mono_pcm = b""
+
+    @property
+    def enabled(self) -> bool:
+        return self._enabled
+
+    def _load(self) -> None:
+        if self._loaded:
+            return
+        self._loaded = True
+        p = Path(self._path)
+        if not p.exists():
+            logger.warning("[AMBIENCE_MIX] file not found: %s", p)
+            return
+        try:
+            with wave.open(str(p), "rb") as wf:
+                self._in_rate = wf.getframerate()
+                in_channels = wf.getnchannels()
+                self._sample_width = wf.getsampwidth()
+                if self._sample_width != 2:
+                    logger.warning(
+                        "[AMBIENCE_MIX] unsupported sample width=%s file=%s",
+                        self._sample_width,
+                        p,
+                    )
+                    return
+                pcm = wf.readframes(wf.getnframes())
+                if in_channels > 1:
+                    pcm = audioop.tomono(pcm, self._sample_width, 0.5, 0.5)
+                self._mono_pcm = pcm
+            self._enabled = bool(self._mono_pcm)
+            logger.info(
+                "[AMBIENCE_MIX] loaded file=%s in_rate=%s mono_bytes=%s gain=%.2f",
+                p,
+                self._in_rate,
+                len(self._mono_pcm),
+                self._gain,
+            )
+        except Exception:
+            logger.exception("[AMBIENCE_MIX] failed to load file=%s", p)
+            self._enabled = False
+
+    def _loop_slice(self, data: bytes, start: int, length: int) -> tuple[bytes, int]:
+        if not data or length <= 0:
+            return b"", start
+        out = bytearray()
+        pos = start
+        size = len(data)
+        while len(out) < length:
+            take = min(length - len(out), size - pos)
+            out.extend(data[pos : pos + take])
+            pos += take
+            if pos >= size:
+                pos = 0
+        return bytes(out), pos
+
+    def _ambience_for(self, sample_rate: int, num_channels: int, length_bytes: int) -> bytes:
+        key = (sample_rate, num_channels)
+        if key not in self._cache:
+            pcm = self._mono_pcm
+            if sample_rate != self._in_rate:
+                pcm, _ = audioop.ratecv(
+                    pcm,
+                    self._sample_width,
+                    1,
+                    self._in_rate,
+                    sample_rate,
+                    None,
+                )
+            if num_channels == 2:
+                pcm = audioop.tostereo(pcm, self._sample_width, 1.0, 1.0)
+            self._cache[key] = pcm
+            self._positions[key] = 0
+            logger.info(
+                "[AMBIENCE_MIX] prepared stream rate=%s channels=%s bytes=%s",
+                sample_rate,
+                num_channels,
+                len(pcm),
+            )
+        data = self._cache[key]
+        pos = self._positions[key]
+        out, new_pos = self._loop_slice(data, pos, length_bytes)
+        self._positions[key] = new_pos
+        if self._gain != 1.0:
+            out = audioop.mul(out, self._sample_width, self._gain)
+        return out
+
+    def mix_frame(self, frame: rtc.AudioFrame) -> rtc.AudioFrame:
+        self._load()
+        if not self._enabled:
+            return frame
+        try:
+            ambience = self._ambience_for(
+                sample_rate=frame.sample_rate,
+                num_channels=frame.num_channels,
+                length_bytes=len(frame.data),
+            )
+            mixed = audioop.add(frame.data, ambience, self._sample_width)
+            return rtc.AudioFrame(
+                data=mixed,
+                sample_rate=frame.sample_rate,
+                num_channels=frame.num_channels,
+                samples_per_channel=frame.samples_per_channel,
+            )
+        except Exception:
+            logger.exception("[AMBIENCE_MIX] frame mix failed, disabling ambience mix")
+            self._enabled = False
+            return frame
 def _best_effort_caller_id(room: rtc.Room) -> Optional[str]:
     try:
         for p in room.remote_participants.values():
@@ -203,6 +324,12 @@ def _format_day_blocks_for_voice(day_blocks: list[Dict[str, Any]]) -> str:
 
 class Assistant(Agent):
     def __init__(self, call_context_text: str) -> None:
+        self._ambience_mixer = (
+            _WavAmbienceMixer(AMBIENCE_FILE, gain=AMBIENCE_GAIN)
+            if ENABLE_AMBIENCE_TTS_MIX
+            else None
+        )
+        self._mix_frames = 0
         super().__init__(
             instructions=(
                 """
@@ -259,6 +386,17 @@ Call context:
                 + call_context_text
             )
         )
+
+    async def tts_node(self, text: str, model_settings: Any) -> AsyncIterable[rtc.AudioFrame]:
+        async for frame in Agent.default.tts_node(self, text, model_settings):
+            if self._ambience_mixer is None:
+                yield frame
+                continue
+            mixed = self._ambience_mixer.mix_frame(frame)
+            self._mix_frames += 1
+            if self._mix_frames == 1:
+                logger.info("[AMBIENCE_MIX] first mixed frame delivered")
+            yield mixed
 
     @function_tool
     async def check_meeting_slot(
@@ -393,8 +531,9 @@ async def my_agent(ctx: JobContext):
     ctx.log_context_fields = {"room": ctx.room.name}
     logger.info("[CALL_START] room=%s", ctx.room.name)
     logger.info(
-        "[AMBIENCE] config enabled=%s file=%s out_rate=%s gain=%.2f source=%s heartbeat=%ss",
+        "[AMBIENCE] config track_enabled=%s tts_mix_enabled=%s file=%s out_rate=%s gain=%.2f source=%s heartbeat=%ss",
         ENABLE_AMBIENCE_LOOP,
+        ENABLE_AMBIENCE_TTS_MIX,
         AMBIENCE_FILE,
         AMBIENCE_OUTPUT_SAMPLE_RATE,
         AMBIENCE_GAIN,
@@ -596,6 +735,12 @@ async def my_agent(ctx: JobContext):
                 len(payload["messages"]),
                 len(payload["transcript"]),
             )
+            if not payload["messages"] and not payload["transcript"]:
+                logger.warning(
+                    "[CALL_END] transcript payload is empty room=%s reason=%s",
+                    ctx.room.name,
+                    reason,
+                )
             await _post_json("/events/transcript", payload)
             logger.info(
                 "[CALL_END] transcript sent room=%s messages=%s",
@@ -613,7 +758,7 @@ async def my_agent(ctx: JobContext):
 
     await ctx.connect()
 
-    if ENABLE_AMBIENCE_LOOP:
+    if ENABLE_AMBIENCE_LOOP and not ENABLE_AMBIENCE_TTS_MIX:
         ambience_task = asyncio.create_task(_ambience_loop())
 
     await asyncio.sleep(0.3)
