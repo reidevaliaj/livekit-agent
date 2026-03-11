@@ -2,11 +2,8 @@
 import time
 import logging
 import asyncio
-import audioop
-import wave
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
-from typing import Optional, Dict, Any, AsyncIterable
+from typing import Optional, Dict, Any
 from zoneinfo import ZoneInfo
 
 import httpx
@@ -39,177 +36,16 @@ load_dotenv(".env.local")
 FASTAPI_BASE_URL = os.getenv("FASTAPI_BASE_URL", "https://voice.code-studio.eu")
 TENANT_ID = os.getenv("TENANT_ID", "codestudio")
 BUSINESS_TIMEZONE = os.getenv("BUSINESS_TIMEZONE", "Europe/Budapest")
-AGENT_NUM_IDLE_PROCESSES = int(os.getenv("AGENT_NUM_IDLE_PROCESSES", "1").strip() or "1")
-AGENT_LOAD_THRESHOLD = float(os.getenv("AGENT_LOAD_THRESHOLD", "0.92").strip() or "0.92")
+AGENT_NUM_IDLE_PROCESSES = int(os.getenv("AGENT_NUM_IDLE_PROCESSES", "0").strip() or "0")
+AGENT_LOAD_THRESHOLD = float(os.getenv("AGENT_LOAD_THRESHOLD", "0.98").strip() or "0.98")
 LLM_MODEL = os.getenv("LLM_MODEL", "gpt-4.1-mini").strip() or "gpt-4.1-mini"
-ENABLE_LLM_WARMUP = os.getenv("ENABLE_LLM_WARMUP", "true").strip().lower() == "true"
+ENABLE_LLM_WARMUP = os.getenv("ENABLE_LLM_WARMUP", "false").strip().lower() == "true"
 LLM_WARMUP_TIMEOUT_SEC = float(os.getenv("LLM_WARMUP_TIMEOUT_SEC", "3.5").strip() or "3.5")
 LLM_WARMUP_MODEL = os.getenv("LLM_WARMUP_MODEL", "gpt-4.1-nano").strip() or "gpt-4.1-nano"
 
 # Filler bridge removed on purpose to avoid false triggers and extra TTS load.
 ENABLE_FILLER_BRIDGE = False
 
-ENABLE_AMBIENCE_LOOP = os.getenv("ENABLE_AMBIENCE_LOOP", "false").strip().lower() == "true"
-ENABLE_AMBIENCE_TTS_MIX = os.getenv("ENABLE_AMBIENCE_TTS_MIX", "true").strip().lower() == "true"
-AMBIENCE_FILE = os.getenv("AMBIENCE_FILE", str(Path(__file__).parent / "assets" / "ambience_office.wav"))
-AMBIENCE_OUTPUT_SAMPLE_RATE = int(os.getenv("AMBIENCE_OUTPUT_SAMPLE_RATE", "8000").strip() or "8000")
-AMBIENCE_GAIN = float(os.getenv("AMBIENCE_GAIN", "1.6").strip() or "1.6")
-AMBIENCE_LOG_HEARTBEAT_SEC = float(
-    os.getenv("AMBIENCE_LOG_HEARTBEAT_SEC", "5").strip() or "5"
-)
-AMBIENCE_TRACK_SOURCE = (
-    os.getenv("AMBIENCE_TRACK_SOURCE", "unknown").strip().lower() or "unknown"
-)
-
-
-def _ambience_track_source() -> rtc.TrackSource:
-    if AMBIENCE_TRACK_SOURCE in ("mic", "microphone"):
-        return rtc.TrackSource.SOURCE_MICROPHONE
-    if AMBIENCE_TRACK_SOURCE == "screen_share_audio":
-        return rtc.TrackSource.SOURCE_SCREEN_SHARE_AUDIO
-    if AMBIENCE_TRACK_SOURCE == "screen_share":
-        return rtc.TrackSource.SOURCE_SCREEN_SHARE
-    if AMBIENCE_TRACK_SOURCE == "camera":
-        return rtc.TrackSource.SOURCE_CAMERA
-    return rtc.TrackSource.SOURCE_UNKNOWN
-
-
-class _WavAmbienceMixer:
-    def __init__(self, path: str, gain: float = 1.0) -> None:
-        self._path = path
-        self._gain = gain
-        self._cache: Dict[tuple[int, int], bytes] = {}
-        self._positions: Dict[tuple[int, int], int] = {}
-        self._loaded = False
-        self._enabled = False
-        self._sample_width = 2
-        self._in_rate = 0
-        self._mono_pcm = b""
-
-    @property
-    def enabled(self) -> bool:
-        return self._enabled
-
-    def _load(self) -> None:
-        if self._loaded:
-            return
-        self._loaded = True
-        p = Path(self._path)
-        if not p.exists():
-            logger.warning("[AMBIENCE_MIX] file not found: %s", p)
-            return
-        try:
-            with wave.open(str(p), "rb") as wf:
-                self._in_rate = wf.getframerate()
-                in_channels = wf.getnchannels()
-                self._sample_width = wf.getsampwidth()
-                if self._sample_width != 2:
-                    logger.warning(
-                        "[AMBIENCE_MIX] unsupported sample width=%s file=%s",
-                        self._sample_width,
-                        p,
-                    )
-                    return
-                pcm = wf.readframes(wf.getnframes())
-                if in_channels > 1:
-                    pcm = audioop.tomono(pcm, self._sample_width, 0.5, 0.5)
-                self._mono_pcm = pcm
-            self._enabled = bool(self._mono_pcm)
-            logger.info(
-                "[AMBIENCE_MIX] loaded file=%s in_rate=%s mono_bytes=%s gain=%.2f",
-                p,
-                self._in_rate,
-                len(self._mono_pcm),
-                self._gain,
-            )
-        except Exception:
-            logger.exception("[AMBIENCE_MIX] failed to load file=%s", p)
-            self._enabled = False
-
-    def _loop_slice(self, data: bytes, start: int, length: int) -> tuple[bytes, int]:
-        if not data or length <= 0:
-            return b"", start
-        out = bytearray()
-        pos = start
-        size = len(data)
-        while len(out) < length:
-            take = min(length - len(out), size - pos)
-            out.extend(data[pos : pos + take])
-            pos += take
-            if pos >= size:
-                pos = 0
-        return bytes(out), pos
-
-    def _ambience_for(self, sample_rate: int, num_channels: int, length_bytes: int) -> bytes:
-        key = (sample_rate, num_channels)
-        if key not in self._cache:
-            pcm = self._mono_pcm
-            if sample_rate != self._in_rate:
-                pcm, _ = audioop.ratecv(
-                    pcm,
-                    self._sample_width,
-                    1,
-                    self._in_rate,
-                    sample_rate,
-                    None,
-                )
-            if num_channels == 2:
-                pcm = audioop.tostereo(pcm, self._sample_width, 1.0, 1.0)
-            self._cache[key] = pcm
-            self._positions[key] = 0
-            logger.info(
-                "[AMBIENCE_MIX] prepared stream rate=%s channels=%s bytes=%s",
-                sample_rate,
-                num_channels,
-                len(pcm),
-            )
-        data = self._cache[key]
-        pos = self._positions[key]
-        out, new_pos = self._loop_slice(data, pos, length_bytes)
-        self._positions[key] = new_pos
-        if self._gain != 1.0:
-            out = audioop.mul(out, self._sample_width, self._gain)
-        return out
-
-    def mix_frame(self, frame: rtc.AudioFrame) -> rtc.AudioFrame:
-        self._load()
-        if not self._enabled:
-            return frame
-        try:
-            frame_bytes = bytes(frame.data)
-            ambience = self._ambience_for(
-                sample_rate=frame.sample_rate,
-                num_channels=frame.num_channels,
-                length_bytes=len(frame_bytes),
-            )
-            # Be defensive: align lengths to whole 16-bit samples.
-            mix_len = min(len(frame_bytes), len(ambience))
-            mix_len -= mix_len % self._sample_width
-            if mix_len <= 0:
-                return frame
-            mixed = audioop.add(
-                frame_bytes[:mix_len],
-                ambience[:mix_len],
-                self._sample_width,
-            )
-            if mix_len < len(frame_bytes):
-                mixed += frame_bytes[mix_len:]
-            return rtc.AudioFrame(
-                data=mixed,
-                sample_rate=frame.sample_rate,
-                num_channels=frame.num_channels,
-                samples_per_channel=frame.samples_per_channel,
-            )
-        except Exception:
-            logger.exception(
-                "[AMBIENCE_MIX] frame mix failed, disabling ambience mix frame_len=%s rate=%s ch=%s samples=%s",
-                len(bytes(frame.data)),
-                frame.sample_rate,
-                frame.num_channels,
-                frame.samples_per_channel,
-            )
-            self._enabled = False
-            return frame
 def _best_effort_caller_id(room: rtc.Room) -> Optional[str]:
     try:
         for p in room.remote_participants.values():
@@ -390,12 +226,6 @@ def _format_day_blocks_for_voice(day_blocks: list[Dict[str, Any]]) -> str:
 
 class Assistant(Agent):
     def __init__(self, call_context_text: str) -> None:
-        self._ambience_mixer = (
-            _WavAmbienceMixer(AMBIENCE_FILE, gain=AMBIENCE_GAIN)
-            if ENABLE_AMBIENCE_TTS_MIX
-            else None
-        )
-        self._mix_frames = 0
         super().__init__(
             instructions=(
                 """
@@ -453,17 +283,6 @@ Call context:
                 + call_context_text
             )
         )
-
-    async def tts_node(self, text: str, model_settings: Any) -> AsyncIterable[rtc.AudioFrame]:
-        async for frame in Agent.default.tts_node(self, text, model_settings):
-            if self._ambience_mixer is None:
-                yield frame
-                continue
-            mixed = self._ambience_mixer.mix_frame(frame)
-            self._mix_frames += 1
-            if self._mix_frames == 1:
-                logger.info("[AMBIENCE_MIX] first mixed frame delivered")
-            yield mixed
 
     @function_tool
     async def check_meeting_slot(
@@ -612,16 +431,6 @@ server.setup_fnc = prewarm
 async def my_agent(ctx: JobContext):
     ctx.log_context_fields = {"room": ctx.room.name}
     logger.info("[CALL_START] room=%s", ctx.room.name)
-    logger.info(
-        "[AMBIENCE] config track_enabled=%s tts_mix_enabled=%s file=%s out_rate=%s gain=%.2f source=%s heartbeat=%ss",
-        ENABLE_AMBIENCE_LOOP,
-        ENABLE_AMBIENCE_TTS_MIX,
-        AMBIENCE_FILE,
-        AMBIENCE_OUTPUT_SAMPLE_RATE,
-        AMBIENCE_GAIN,
-        AMBIENCE_TRACK_SOURCE,
-        AMBIENCE_LOG_HEARTBEAT_SEC,
-    )
 
     now_utc = datetime.now(timezone.utc)
     now_local = now_utc.astimezone(ZoneInfo(BUSINESS_TIMEZONE))
@@ -659,153 +468,8 @@ async def my_agent(ctx: JobContext):
         ),
     )
 
-    ambience_stop_event = asyncio.Event()
-    ambience_task: Optional[asyncio.Task[Any]] = None
-    ambience_pub: Optional[rtc.LocalTrackPublication] = None
-    ambience_track: Optional[rtc.LocalAudioTrack] = None
-
-    async def _ambience_loop() -> None:
-        ambience_path = Path(AMBIENCE_FILE)
-        if not ambience_path.exists():
-            logger.warning("[AMBIENCE] file not found: %s", ambience_path)
-            return
-
-        try:
-            with wave.open(str(ambience_path), "rb") as wf:
-                in_rate = wf.getframerate()
-                in_channels = wf.getnchannels()
-                sample_width = wf.getsampwidth()
-                logger.info(
-                    "[AMBIENCE] opened file=%s in_rate=%s in_channels=%s sample_width=%s",
-                    ambience_path,
-                    in_rate,
-                    in_channels,
-                    sample_width,
-                )
-                if sample_width != 2:
-                    logger.warning(
-                        "[AMBIENCE] unsupported sample width=%s in %s (expected 16-bit PCM)",
-                        sample_width,
-                        ambience_path,
-                    )
-                    return
-
-                out_rate = AMBIENCE_OUTPUT_SAMPLE_RATE
-                out_channels = 1
-                source = rtc.AudioSource(sample_rate=out_rate, num_channels=out_channels)
-                track = rtc.LocalAudioTrack.create_audio_track("office_ambience", source)
-                publish_opts = rtc.TrackPublishOptions()
-                publish_opts.source = _ambience_track_source()
-                nonlocal ambience_pub, ambience_track
-                ambience_pub = await ctx.room.local_participant.publish_track(track, publish_opts)
-                ambience_track = track
-                logger.info(
-                    "[AMBIENCE] started loop file=%s in_rate=%s out_rate=%s in_channels=%s out_channels=%s gain=%.2f track_sid=%s track_source=%s",
-                    ambience_path,
-                    in_rate,
-                    out_rate,
-                    in_channels,
-                    out_channels,
-                    AMBIENCE_GAIN,
-                    ambience_pub.sid if ambience_pub else None,
-                    publish_opts.source,
-                )
-
-                frame_duration_sec = 0.02
-                in_frame_samples = max(1, int(in_rate * frame_duration_sec))
-                rate_state = None
-                frames_sent = 0
-                rewinds = 0
-                samples_total = 0
-                first_frame_logged = False
-                last_heartbeat_ts = time.monotonic()
-
-                while not ambience_stop_event.is_set():
-                    pcm = wf.readframes(in_frame_samples)
-                    if not pcm:
-                        wf.rewind()
-                        rate_state = None
-                        rewinds += 1
-                        logger.debug("[AMBIENCE] rewind count=%s", rewinds)
-                        continue
-
-                    if in_channels > 1:
-                        pcm = audioop.tomono(pcm, sample_width, 0.5, 0.5)
-
-                    if AMBIENCE_GAIN != 1.0:
-                        try:
-                            pcm = audioop.mul(pcm, sample_width, AMBIENCE_GAIN)
-                        except Exception:
-                            pass
-
-                    if in_rate != out_rate:
-                        pcm, rate_state = audioop.ratecv(
-                            pcm,
-                            sample_width,
-                            out_channels,
-                            in_rate,
-                            out_rate,
-                            rate_state,
-                        )
-
-                    samples_per_channel = len(pcm) // (2 * out_channels)
-                    if samples_per_channel <= 0:
-                        continue
-
-                    frame = rtc.AudioFrame(
-                        data=pcm,
-                        sample_rate=out_rate,
-                        num_channels=out_channels,
-                        samples_per_channel=samples_per_channel,
-                    )
-                    await source.capture_frame(frame)
-                    frames_sent += 1
-                    samples_total += samples_per_channel
-                    if not first_frame_logged:
-                        first_frame_logged = True
-                        logger.info(
-                            "[AMBIENCE] first frame sent samples=%s bytes=%s",
-                            samples_per_channel,
-                            len(pcm),
-                        )
-                    now_ts = time.monotonic()
-                    if now_ts - last_heartbeat_ts >= AMBIENCE_LOG_HEARTBEAT_SEC:
-                        logger.info(
-                            "[AMBIENCE] heartbeat frames=%s rewinds=%s seconds_sent=%.2f",
-                            frames_sent,
-                            rewinds,
-                            samples_total / out_rate,
-                        )
-                        last_heartbeat_ts = now_ts
-                    await asyncio.sleep(samples_per_channel / out_rate)
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            logger.exception("[AMBIENCE] loop failed")
-
     async def _send_transcript_on_shutdown(reason: str) -> None:
         logger.info("[CALL_END] shutdown callback fired room=%s reason=%s", ctx.room.name, reason)
-        logger.info(
-            "[AMBIENCE] shutdown task_active=%s track_sid=%s",
-            bool(ambience_task and not ambience_task.done()),
-            ambience_pub.sid if ambience_pub else None,
-        )
-
-        ambience_stop_event.set()
-        if ambience_task and not ambience_task.done():
-            ambience_task.cancel()
-            try:
-                await ambience_task
-            except asyncio.CancelledError:
-                pass
-            except Exception:
-                logger.exception("[AMBIENCE] cleanup failed")
-        try:
-            if ambience_pub is not None:
-                await ctx.room.local_participant.unpublish_track(ambience_pub.sid)
-                logger.info("[AMBIENCE] unpublished track sid=%s", ambience_pub.sid)
-        except Exception:
-            logger.exception("[AMBIENCE] unpublish failed")
 
         try:
             payload = _build_transcript_payload(
@@ -842,9 +506,6 @@ async def my_agent(ctx: JobContext):
 
     if ENABLE_LLM_WARMUP:
         asyncio.create_task(_warmup_llm_once())
-
-    if ENABLE_AMBIENCE_LOOP and not ENABLE_AMBIENCE_TTS_MIX:
-        ambience_task = asyncio.create_task(_ambience_loop())
 
     await asyncio.sleep(0.3)
     await session.say("Thanks for calling Code Studio. How may we help you today?")
