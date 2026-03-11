@@ -42,9 +42,10 @@ LLM_MODEL = os.getenv("LLM_MODEL", "gpt-4.1-mini").strip() or "gpt-4.1-mini"
 ENABLE_LLM_WARMUP = os.getenv("ENABLE_LLM_WARMUP", "false").strip().lower() == "true"
 LLM_WARMUP_TIMEOUT_SEC = float(os.getenv("LLM_WARMUP_TIMEOUT_SEC", "3.5").strip() or "3.5")
 LLM_WARMUP_MODEL = os.getenv("LLM_WARMUP_MODEL", "gpt-4.1-nano").strip() or "gpt-4.1-nano"
-
-# Filler bridge removed on purpose to avoid false triggers and extra TTS load.
-ENABLE_FILLER_BRIDGE = False
+ENABLE_BRIDGE_FILLER = os.getenv("ENABLE_BRIDGE_FILLER", "true").strip().lower() == "true"
+BRIDGE_FILLER_DELAY_SEC = float(os.getenv("BRIDGE_FILLER_DELAY_SEC", "1.5").strip() or "1.5")
+BRIDGE_FILLER_TEXT = os.getenv("BRIDGE_FILLER_TEXT", "So...").strip() or "So..."
+BRIDGE_FILLER_MAX_PER_CALL = int(os.getenv("BRIDGE_FILLER_MAX_PER_CALL", "2").strip() or "2")
 
 def _best_effort_caller_id(room: rtc.Room) -> Optional[str]:
     try:
@@ -249,7 +250,6 @@ Our services (only these):
 Rules:
 - Speak in a warm, business-professional tone.
 - Keep responses short (phone style).
-- To reduce dead air, begin replies with "So..." then continue naturally.
 - On the caller's first turn, answer in one short sentence, then ask one focused question.
 - Ask only the needed questions.
 - Do not promise prices or timelines.
@@ -433,9 +433,13 @@ async def my_agent(ctx: JobContext):
     ctx.log_context_fields = {"room": ctx.room.name}
     logger.info("[CALL_START] room=%s", ctx.room.name)
     logger.info(
-        "[SESSION_CONFIG] llm_model=%s turn_detector=MultilingualModel preemptive_generation=%s",
+        "[SESSION_CONFIG] llm_model=%s turn_detector=MultilingualModel preemptive_generation=%s bridge_filler=%s delay=%.2fs text=%s max_per_call=%s",
         LLM_MODEL,
         True,
+        ENABLE_BRIDGE_FILLER,
+        BRIDGE_FILLER_DELAY_SEC,
+        BRIDGE_FILLER_TEXT,
+        BRIDGE_FILLER_MAX_PER_CALL,
     )
 
     now_utc = datetime.now(timezone.utc)
@@ -473,6 +477,69 @@ async def my_agent(ctx: JobContext):
             ),
         ),
     )
+
+    bridge_task: Optional[asyncio.Task[Any]] = None
+    waiting_turn_id = 0
+    bridge_sent = 0
+
+    def _cancel_bridge_task() -> None:
+        nonlocal bridge_task
+        if bridge_task and not bridge_task.done():
+            bridge_task.cancel()
+        bridge_task = None
+
+    async def _bridge_if_slow(turn_id: int) -> None:
+        nonlocal bridge_sent
+        try:
+            await asyncio.sleep(BRIDGE_FILLER_DELAY_SEC)
+            if not ENABLE_BRIDGE_FILLER:
+                return
+            if turn_id != waiting_turn_id:
+                return
+            if bridge_sent >= BRIDGE_FILLER_MAX_PER_CALL:
+                return
+            bridge_sent += 1
+            logger.info(
+                "[BRIDGE] sending filler turn=%s count=%s text=%s",
+                turn_id,
+                bridge_sent,
+                BRIDGE_FILLER_TEXT,
+            )
+            await session.say(BRIDGE_FILLER_TEXT)
+        except asyncio.CancelledError:
+            return
+        except Exception:
+            logger.exception("[BRIDGE] filler say failed turn=%s", turn_id)
+
+    @session.on("conversation_item_added")
+    def _on_conversation_item_added(event) -> None:
+        nonlocal waiting_turn_id, bridge_task
+        item = getattr(event, "item", None)
+        role = getattr(item, "role", None)
+        if role == "user":
+            waiting_turn_id += 1
+            _cancel_bridge_task()
+            if ENABLE_BRIDGE_FILLER:
+                bridge_task = asyncio.create_task(_bridge_if_slow(waiting_turn_id))
+                logger.info(
+                    "[BRIDGE] armed turn=%s delay=%.2fs",
+                    waiting_turn_id,
+                    BRIDGE_FILLER_DELAY_SEC,
+                )
+            return
+        if role == "assistant":
+            waiting_turn_id = 0
+            _cancel_bridge_task()
+
+    @session.on("speech_created")
+    def _on_speech_created(event) -> None:
+        nonlocal waiting_turn_id
+        source = str(getattr(event, "source", ""))
+        # Cancel bridge only when model/tool response speech is created.
+        # Ignore `say` because that is used for static lines and the filler itself.
+        if source.lower() != "say":
+            waiting_turn_id = 0
+            _cancel_bridge_task()
 
     async def _send_transcript_on_shutdown(reason: str) -> None:
         logger.info("[CALL_END] shutdown callback fired room=%s reason=%s", ctx.room.name, reason)
