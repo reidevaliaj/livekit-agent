@@ -170,12 +170,24 @@ class _WavAmbienceMixer:
         if not self._enabled:
             return frame
         try:
+            frame_bytes = bytes(frame.data)
             ambience = self._ambience_for(
                 sample_rate=frame.sample_rate,
                 num_channels=frame.num_channels,
-                length_bytes=len(frame.data),
+                length_bytes=len(frame_bytes),
             )
-            mixed = audioop.add(frame.data, ambience, self._sample_width)
+            # Be defensive: align lengths to whole 16-bit samples.
+            mix_len = min(len(frame_bytes), len(ambience))
+            mix_len -= mix_len % self._sample_width
+            if mix_len <= 0:
+                return frame
+            mixed = audioop.add(
+                frame_bytes[:mix_len],
+                ambience[:mix_len],
+                self._sample_width,
+            )
+            if mix_len < len(frame_bytes):
+                mixed += frame_bytes[mix_len:]
             return rtc.AudioFrame(
                 data=mixed,
                 sample_rate=frame.sample_rate,
@@ -183,7 +195,13 @@ class _WavAmbienceMixer:
                 samples_per_channel=frame.samples_per_channel,
             )
         except Exception:
-            logger.exception("[AMBIENCE_MIX] frame mix failed, disabling ambience mix")
+            logger.exception(
+                "[AMBIENCE_MIX] frame mix failed, disabling ambience mix frame_len=%s rate=%s ch=%s samples=%s",
+                len(bytes(frame.data)),
+                frame.sample_rate,
+                frame.num_channels,
+                frame.samples_per_channel,
+            )
             self._enabled = False
             return frame
 def _best_effort_caller_id(room: rtc.Room) -> Optional[str]:
