@@ -42,9 +42,6 @@ LLM_MODEL = os.getenv("LLM_MODEL", "gpt-4.1-mini").strip() or "gpt-4.1-mini"
 ENABLE_LLM_WARMUP = os.getenv("ENABLE_LLM_WARMUP", "false").strip().lower() == "true"
 LLM_WARMUP_TIMEOUT_SEC = float(os.getenv("LLM_WARMUP_TIMEOUT_SEC", "3.5").strip() or "3.5")
 LLM_WARMUP_MODEL = os.getenv("LLM_WARMUP_MODEL", "gpt-4.1-nano").strip() or "gpt-4.1-nano"
-ENABLE_TURN_DETECTOR = os.getenv("ENABLE_TURN_DETECTOR", "true").strip().lower() == "true"
-MIN_ENDPOINTING_DELAY_SEC = float(os.getenv("MIN_ENDPOINTING_DELAY_SEC", "0.15").strip() or "0.15")
-MAX_ENDPOINTING_DELAY_SEC = float(os.getenv("MAX_ENDPOINTING_DELAY_SEC", "1.0").strip() or "1.0")
 
 # Filler bridge removed on purpose to avoid false triggers and extra TTS load.
 ENABLE_FILLER_BRIDGE = False
@@ -252,6 +249,7 @@ Our services (only these):
 Rules:
 - Speak in a warm, business-professional tone.
 - Keep responses short (phone style).
+- To reduce dead air, begin replies with "So..." then continue naturally.
 - On the caller's first turn, answer in one short sentence, then ask one focused question.
 - Ask only the needed questions.
 - Do not promise prices or timelines.
@@ -435,11 +433,8 @@ async def my_agent(ctx: JobContext):
     ctx.log_context_fields = {"room": ctx.room.name}
     logger.info("[CALL_START] room=%s", ctx.room.name)
     logger.info(
-        "[SESSION_CONFIG] llm_model=%s turn_detector=%s min_endpointing=%.2fs max_endpointing=%.2fs preemptive_generation=%s",
+        "[SESSION_CONFIG] llm_model=%s turn_detector=MultilingualModel preemptive_generation=%s",
         LLM_MODEL,
-        ENABLE_TURN_DETECTOR,
-        MIN_ENDPOINTING_DELAY_SEC,
-        MAX_ENDPOINTING_DELAY_SEC,
         True,
     )
 
@@ -452,31 +447,17 @@ async def my_agent(ctx: JobContext):
         f"Meeting booking horizon ends at ({BUSINESS_TIMEZONE}): {two_weeks_local.isoformat()}"
     )
 
-    session_kwargs: Dict[str, Any] = {
-        "stt": deepgram.STT(model="nova-3", language="multi"),
-        "llm": openai.LLM(model=LLM_MODEL),
-        "tts": cartesia.TTS(
+    session = AgentSession(
+        stt=deepgram.STT(model="nova-3", language="multi"),
+        llm=openai.LLM(model=LLM_MODEL),
+        tts=cartesia.TTS(
             model="sonic-3",
             voice="9626c31c-bec5-4cca-baa8-f8ba9e84c8bc",
         ),
-        "vad": ctx.proc.userdata["vad"],
-        "preemptive_generation": True,
-        "min_endpointing_delay": MIN_ENDPOINTING_DELAY_SEC,
-        "max_endpointing_delay": MAX_ENDPOINTING_DELAY_SEC,
-    }
-    if ENABLE_TURN_DETECTOR:
-        session_kwargs["turn_detection"] = MultilingualModel()
-
-    try:
-        session = AgentSession(**session_kwargs)
-    except TypeError:
-        # Backward-compatible fallback for older SDK signatures.
-        logger.warning(
-            "[SESSION_CONFIG] AgentSession() endpointing args unsupported by this SDK; falling back"
-        )
-        session_kwargs.pop("min_endpointing_delay", None)
-        session_kwargs.pop("max_endpointing_delay", None)
-        session = AgentSession(**session_kwargs)
+        turn_detection=MultilingualModel(),
+        vad=ctx.proc.userdata["vad"],
+        preemptive_generation=True,
+    )
 
     await session.start(
         agent=Assistant(call_context_text=call_context_text),
