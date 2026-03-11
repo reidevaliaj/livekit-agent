@@ -36,12 +36,15 @@ load_dotenv(".env.local")
 FASTAPI_BASE_URL = os.getenv("FASTAPI_BASE_URL", "https://voice.code-studio.eu")
 TENANT_ID = os.getenv("TENANT_ID", "codestudio")
 BUSINESS_TIMEZONE = os.getenv("BUSINESS_TIMEZONE", "Europe/Budapest")
-AGENT_NUM_IDLE_PROCESSES = int(os.getenv("AGENT_NUM_IDLE_PROCESSES", "0").strip() or "0")
-AGENT_LOAD_THRESHOLD = float(os.getenv("AGENT_LOAD_THRESHOLD", "0.98").strip() or "0.98")
+AGENT_NUM_IDLE_PROCESSES = int(os.getenv("AGENT_NUM_IDLE_PROCESSES", "1").strip() or "1")
+AGENT_LOAD_THRESHOLD = float(os.getenv("AGENT_LOAD_THRESHOLD", "0.95").strip() or "0.95")
 LLM_MODEL = os.getenv("LLM_MODEL", "gpt-4.1-mini").strip() or "gpt-4.1-mini"
 ENABLE_LLM_WARMUP = os.getenv("ENABLE_LLM_WARMUP", "false").strip().lower() == "true"
 LLM_WARMUP_TIMEOUT_SEC = float(os.getenv("LLM_WARMUP_TIMEOUT_SEC", "3.5").strip() or "3.5")
 LLM_WARMUP_MODEL = os.getenv("LLM_WARMUP_MODEL", "gpt-4.1-nano").strip() or "gpt-4.1-nano"
+ENABLE_TURN_DETECTOR = os.getenv("ENABLE_TURN_DETECTOR", "true").strip().lower() == "true"
+MIN_ENDPOINTING_DELAY_SEC = float(os.getenv("MIN_ENDPOINTING_DELAY_SEC", "0.15").strip() or "0.15")
+MAX_ENDPOINTING_DELAY_SEC = float(os.getenv("MAX_ENDPOINTING_DELAY_SEC", "1.0").strip() or "1.0")
 
 # Filler bridge removed on purpose to avoid false triggers and extra TTS load.
 ENABLE_FILLER_BRIDGE = False
@@ -431,6 +434,14 @@ server.setup_fnc = prewarm
 async def my_agent(ctx: JobContext):
     ctx.log_context_fields = {"room": ctx.room.name}
     logger.info("[CALL_START] room=%s", ctx.room.name)
+    logger.info(
+        "[SESSION_CONFIG] llm_model=%s turn_detector=%s min_endpointing=%.2fs max_endpointing=%.2fs preemptive_generation=%s",
+        LLM_MODEL,
+        ENABLE_TURN_DETECTOR,
+        MIN_ENDPOINTING_DELAY_SEC,
+        MAX_ENDPOINTING_DELAY_SEC,
+        True,
+    )
 
     now_utc = datetime.now(timezone.utc)
     now_local = now_utc.astimezone(ZoneInfo(BUSINESS_TIMEZONE))
@@ -441,17 +452,31 @@ async def my_agent(ctx: JobContext):
         f"Meeting booking horizon ends at ({BUSINESS_TIMEZONE}): {two_weeks_local.isoformat()}"
     )
 
-    session = AgentSession(
-        stt=deepgram.STT(model="nova-3", language="multi"),
-        llm=openai.LLM(model=LLM_MODEL),
-        tts=cartesia.TTS(
+    session_kwargs: Dict[str, Any] = {
+        "stt": deepgram.STT(model="nova-3", language="multi"),
+        "llm": openai.LLM(model=LLM_MODEL),
+        "tts": cartesia.TTS(
             model="sonic-3",
             voice="9626c31c-bec5-4cca-baa8-f8ba9e84c8bc",
         ),
-        turn_detection=MultilingualModel(),
-        vad=ctx.proc.userdata["vad"],
-        preemptive_generation=True,
-    )
+        "vad": ctx.proc.userdata["vad"],
+        "preemptive_generation": True,
+        "min_endpointing_delay": MIN_ENDPOINTING_DELAY_SEC,
+        "max_endpointing_delay": MAX_ENDPOINTING_DELAY_SEC,
+    }
+    if ENABLE_TURN_DETECTOR:
+        session_kwargs["turn_detection"] = MultilingualModel()
+
+    try:
+        session = AgentSession(**session_kwargs)
+    except TypeError:
+        # Backward-compatible fallback for older SDK signatures.
+        logger.warning(
+            "[SESSION_CONFIG] AgentSession() endpointing args unsupported by this SDK; falling back"
+        )
+        session_kwargs.pop("min_endpointing_delay", None)
+        session_kwargs.pop("max_endpointing_delay", None)
+        session = AgentSession(**session_kwargs)
 
     await session.start(
         agent=Assistant(call_context_text=call_context_text),
@@ -507,7 +532,6 @@ async def my_agent(ctx: JobContext):
     if ENABLE_LLM_WARMUP:
         asyncio.create_task(_warmup_llm_once())
 
-    await asyncio.sleep(0.3)
     await session.say("Thanks for calling Code Studio. How may we help you today?")
 
 
