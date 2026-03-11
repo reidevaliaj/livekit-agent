@@ -1,6 +1,7 @@
 ﻿import os
 import time
 import json
+import inspect
 import logging
 import asyncio
 import audioop
@@ -56,6 +57,34 @@ AMBIENCE_DEBUG_FILE = os.getenv(
 AMBIENCE_LOG_HEARTBEAT_SEC = float(
     os.getenv("AMBIENCE_LOG_HEARTBEAT_SEC", "5").strip() or "5"
 )
+STT_MODEL = os.getenv("STT_MODEL", "deepgram/nova-3").strip() or "deepgram/nova-3"
+STT_FALLBACK_MODELS_RAW = os.getenv(
+    "STT_FALLBACK_MODELS",
+    "assemblyai/universal-streaming-multilingual,deepgram/nova-2-phonecall",
+)
+TTS_MODEL = os.getenv("TTS_MODEL", "cartesia/sonic-3").strip() or "cartesia/sonic-3"
+TTS_VOICE = os.getenv(
+    "TTS_VOICE", "9626c31c-bec5-4cca-baa8-f8ba9e84c8bc"
+).strip() or "9626c31c-bec5-4cca-baa8-f8ba9e84c8bc"
+TTS_FALLBACK_MODELS_RAW = os.getenv("TTS_FALLBACK_MODELS", "")
+SHUTDOWN_TRANSCRIPT_TIMEOUT_SEC = float(
+    os.getenv("SHUTDOWN_TRANSCRIPT_TIMEOUT_SEC", "6").strip() or "6"
+)
+SHUTDOWN_TRANSCRIPT_CONNECT_TIMEOUT_SEC = float(
+    os.getenv("SHUTDOWN_TRANSCRIPT_CONNECT_TIMEOUT_SEC", "3").strip() or "3"
+)
+
+
+def _csv_env(value: str) -> list[str]:
+    return [item.strip() for item in value.split(",") if item.strip()]
+
+
+def _supports_kwarg(callable_obj: Any, kwarg: str) -> bool:
+    try:
+        sig = inspect.signature(callable_obj)
+        return kwarg in sig.parameters
+    except Exception:
+        return False
 
 
 def _best_effort_caller_id(room: rtc.Room) -> Optional[str]:
@@ -70,7 +99,13 @@ def _best_effort_caller_id(room: rtc.Room) -> Optional[str]:
     return None
 
 
-async def _post_json(path: str, payload: Dict[str, Any]) -> None:
+async def _post_json(
+    path: str,
+    payload: Dict[str, Any],
+    *,
+    timeout_sec: float = 12.0,
+    connect_timeout_sec: float = 10.0,
+) -> None:
     url = FASTAPI_BASE_URL.rstrip("/") + path
     logger.info(
         "[HTTP_POST] sending path=%s url=%s payload_keys=%s",
@@ -78,7 +113,7 @@ async def _post_json(path: str, payload: Dict[str, Any]) -> None:
         url,
         sorted(payload.keys()),
     )
-    timeout = httpx.Timeout(12.0, connect=10.0)
+    timeout = httpx.Timeout(timeout_sec, connect=connect_timeout_sec)
     async with httpx.AsyncClient(timeout=timeout) as client:
         r = await client.post(url, json=payload)
         logger.info("[HTTP_POST] response path=%s status=%s", path, r.status_code)
@@ -395,13 +430,36 @@ async def my_agent(ctx: JobContext):
         f"Meeting booking horizon ends at ({BUSINESS_TIMEZONE}): {two_weeks_local.isoformat()}"
     )
 
+    stt_fallback_models = _csv_env(STT_FALLBACK_MODELS_RAW)
+    stt_kwargs: Dict[str, Any] = {"model": STT_MODEL, "language": "multi"}
+    if stt_fallback_models and _supports_kwarg(inference.STT, "fallback"):
+        stt_kwargs["fallback"] = stt_fallback_models
+    elif stt_fallback_models:
+        logger.warning(
+            "[SESSION_CONFIG] STT fallback not supported by current livekit-agents version"
+        )
+
+    tts_fallback_models = _csv_env(TTS_FALLBACK_MODELS_RAW)
+    tts_kwargs: Dict[str, Any] = {"model": TTS_MODEL, "voice": TTS_VOICE}
+    if tts_fallback_models and _supports_kwarg(inference.TTS, "fallback"):
+        tts_kwargs["fallback"] = tts_fallback_models
+    elif tts_fallback_models:
+        logger.warning(
+            "[SESSION_CONFIG] TTS fallback not supported by current livekit-agents version"
+        )
+
+    logger.info(
+        "[SESSION_CONFIG] stt_model=%s stt_fallback=%s tts_model=%s tts_fallback=%s",
+        STT_MODEL,
+        stt_fallback_models,
+        TTS_MODEL,
+        tts_fallback_models,
+    )
+
     session = AgentSession(
-        stt=inference.STT(model="deepgram/nova-3", language="multi"),
+        stt=inference.STT(**stt_kwargs),
         llm=inference.LLM(model="openai/gpt-4.1-mini"),
-        tts=inference.TTS(
-            model="cartesia/sonic-3",
-            voice="9626c31c-bec5-4cca-baa8-f8ba9e84c8bc",
-        ),
+        tts=inference.TTS(**tts_kwargs),
         turn_detection=MultilingualModel(),
         vad=ctx.proc.userdata["vad"],
         preemptive_generation=True,
@@ -426,6 +484,8 @@ async def my_agent(ctx: JobContext):
     ambience_task: Optional[asyncio.Task[Any]] = None
     ambience_pub: Optional[rtc.LocalTrackPublication] = None
     ambience_track: Optional[rtc.LocalAudioTrack] = None
+    ambience_unpublished = False
+    shutdown_started = False
     ambience_debug_file = Path(AMBIENCE_DEBUG_FILE)
 
     def _ambience_debug(event: str, **fields: Any) -> None:
@@ -614,6 +674,12 @@ async def my_agent(ctx: JobContext):
             )
 
     async def _send_transcript_on_shutdown(reason: str) -> None:
+        nonlocal shutdown_started, ambience_unpublished
+        if shutdown_started:
+            _ambience_debug("shutdown_skip_duplicate", reason=reason)
+            logger.info("[CALL_END] shutdown callback duplicate ignored room=%s", ctx.room.name)
+            return
+        shutdown_started = True
         logger.info("[CALL_END] shutdown callback fired room=%s reason=%s", ctx.room.name, reason)
         _ambience_debug(
             "shutdown_start",
@@ -635,8 +701,9 @@ async def my_agent(ctx: JobContext):
                 _ambience_debug("cleanup_error")
                 logger.exception("[AMBIENCE] cleanup failed")
         try:
-            if ambience_pub is not None:
+            if ambience_pub is not None and not ambience_unpublished:
                 await ctx.room.local_participant.unpublish_track(ambience_pub.sid)
+                ambience_unpublished = True
                 logger.info("[AMBIENCE] unpublished track sid=%s", ambience_pub.sid)
                 _ambience_debug("track_unpublished", track_sid=ambience_pub.sid)
         except Exception:
@@ -653,7 +720,12 @@ async def my_agent(ctx: JobContext):
                 len(payload["messages"]),
                 len(payload["transcript"]),
             )
-            await _post_json("/events/transcript", payload)
+            await _post_json(
+                "/events/transcript",
+                payload,
+                timeout_sec=SHUTDOWN_TRANSCRIPT_TIMEOUT_SEC,
+                connect_timeout_sec=SHUTDOWN_TRANSCRIPT_CONNECT_TIMEOUT_SEC,
+            )
             logger.info(
                 "[CALL_END] transcript sent room=%s messages=%s",
                 ctx.room.name,
