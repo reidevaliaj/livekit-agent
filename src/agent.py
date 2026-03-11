@@ -1,7 +1,6 @@
 ﻿import os
 import time
 import json
-import inspect
 import logging
 import asyncio
 import audioop
@@ -57,34 +56,12 @@ AMBIENCE_DEBUG_FILE = os.getenv(
 AMBIENCE_LOG_HEARTBEAT_SEC = float(
     os.getenv("AMBIENCE_LOG_HEARTBEAT_SEC", "5").strip() or "5"
 )
-STT_MODEL = os.getenv("STT_MODEL", "deepgram/nova-3").strip() or "deepgram/nova-3"
-STT_FALLBACK_MODELS_RAW = os.getenv(
-    "STT_FALLBACK_MODELS",
-    "assemblyai/universal-streaming-multilingual,deepgram/nova-2-phonecall",
-)
-TTS_MODEL = os.getenv("TTS_MODEL", "cartesia/sonic-3").strip() or "cartesia/sonic-3"
-TTS_VOICE = os.getenv(
-    "TTS_VOICE", "9626c31c-bec5-4cca-baa8-f8ba9e84c8bc"
-).strip() or "9626c31c-bec5-4cca-baa8-f8ba9e84c8bc"
-TTS_FALLBACK_MODELS_RAW = os.getenv("TTS_FALLBACK_MODELS", "")
 SHUTDOWN_TRANSCRIPT_TIMEOUT_SEC = float(
     os.getenv("SHUTDOWN_TRANSCRIPT_TIMEOUT_SEC", "6").strip() or "6"
 )
 SHUTDOWN_TRANSCRIPT_CONNECT_TIMEOUT_SEC = float(
     os.getenv("SHUTDOWN_TRANSCRIPT_CONNECT_TIMEOUT_SEC", "3").strip() or "3"
 )
-
-
-def _csv_env(value: str) -> list[str]:
-    return [item.strip() for item in value.split(",") if item.strip()]
-
-
-def _supports_kwarg(callable_obj: Any, kwarg: str) -> bool:
-    try:
-        sig = inspect.signature(callable_obj)
-        return kwarg in sig.parameters
-    except Exception:
-        return False
 
 
 def _best_effort_caller_id(room: rtc.Room) -> Optional[str]:
@@ -430,36 +407,20 @@ async def my_agent(ctx: JobContext):
         f"Meeting booking horizon ends at ({BUSINESS_TIMEZONE}): {two_weeks_local.isoformat()}"
     )
 
-    stt_fallback_models = _csv_env(STT_FALLBACK_MODELS_RAW)
-    stt_kwargs: Dict[str, Any] = {"model": STT_MODEL, "language": "multi"}
-    if stt_fallback_models and _supports_kwarg(inference.STT, "fallback"):
-        stt_kwargs["fallback"] = stt_fallback_models
-    elif stt_fallback_models:
-        logger.warning(
-            "[SESSION_CONFIG] STT fallback not supported by current livekit-agents version"
-        )
-
-    tts_fallback_models = _csv_env(TTS_FALLBACK_MODELS_RAW)
-    tts_kwargs: Dict[str, Any] = {"model": TTS_MODEL, "voice": TTS_VOICE}
-    if tts_fallback_models and _supports_kwarg(inference.TTS, "fallback"):
-        tts_kwargs["fallback"] = tts_fallback_models
-    elif tts_fallback_models:
-        logger.warning(
-            "[SESSION_CONFIG] TTS fallback not supported by current livekit-agents version"
-        )
-
     logger.info(
-        "[SESSION_CONFIG] stt_model=%s stt_fallback=%s tts_model=%s tts_fallback=%s",
-        STT_MODEL,
-        stt_fallback_models,
-        TTS_MODEL,
-        tts_fallback_models,
+        "[SESSION_CONFIG] stt_model=%s tts_model=%s tts_voice=%s",
+        "deepgram/nova-3",
+        "cartesia/sonic-3",
+        "9626c31c-bec5-4cca-baa8-f8ba9e84c8bc",
     )
 
     session = AgentSession(
-        stt=inference.STT(**stt_kwargs),
+        stt=inference.STT(model="deepgram/nova-3", language="multi"),
         llm=inference.LLM(model="openai/gpt-4.1-mini"),
-        tts=inference.TTS(**tts_kwargs),
+        tts=inference.TTS(
+            model="cartesia/sonic-3",
+            voice="9626c31c-bec5-4cca-baa8-f8ba9e84c8bc",
+        ),
         turn_detection=MultilingualModel(),
         vad=ctx.proc.userdata["vad"],
         preemptive_generation=True,
