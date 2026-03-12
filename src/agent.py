@@ -481,6 +481,7 @@ async def my_agent(ctx: JobContext):
     bridge_task: Optional[asyncio.Task[Any]] = None
     waiting_turn_id = 0
     bridge_sent = 0
+    current_agent_state = "listening"
 
     def _cancel_bridge_task() -> None:
         nonlocal bridge_task
@@ -489,16 +490,19 @@ async def my_agent(ctx: JobContext):
         bridge_task = None
 
     async def _bridge_if_slow(turn_id: int) -> None:
-        nonlocal bridge_sent
+        nonlocal bridge_sent, waiting_turn_id
         try:
             await asyncio.sleep(BRIDGE_FILLER_DELAY_SEC)
             if not ENABLE_BRIDGE_FILLER:
                 return
             if turn_id != waiting_turn_id:
                 return
+            if current_agent_state != "thinking":
+                return
             if bridge_sent >= BRIDGE_FILLER_MAX_PER_CALL:
                 return
             bridge_sent += 1
+            waiting_turn_id = 0
             logger.info(
                 "[BRIDGE] sending filler turn=%s count=%s text=%s",
                 turn_id,
@@ -511,12 +515,13 @@ async def my_agent(ctx: JobContext):
         except Exception:
             logger.exception("[BRIDGE] filler say failed turn=%s", turn_id)
 
-    @session.on("conversation_item_added")
-    def _on_conversation_item_added(event) -> None:
-        nonlocal waiting_turn_id, bridge_task
-        item = getattr(event, "item", None)
-        role = getattr(item, "role", None)
-        if role == "user":
+    @session.on("agent_state_changed")
+    def _on_agent_state_changed(event) -> None:
+        nonlocal waiting_turn_id, bridge_task, current_agent_state
+        raw_state = getattr(event, "new_state", getattr(event, "state", ""))
+        state = str(raw_state).lower().split(".")[-1]
+        current_agent_state = state
+        if state == "thinking":
             waiting_turn_id += 1
             _cancel_bridge_task()
             if ENABLE_BRIDGE_FILLER:
@@ -527,6 +532,24 @@ async def my_agent(ctx: JobContext):
                     BRIDGE_FILLER_DELAY_SEC,
                 )
             return
+        if state == "speaking":
+            waiting_turn_id = 0
+            _cancel_bridge_task()
+
+    @session.on("user_state_changed")
+    def _on_user_state_changed(event) -> None:
+        nonlocal waiting_turn_id
+        raw_state = getattr(event, "new_state", getattr(event, "state", ""))
+        state = str(raw_state).lower().split(".")[-1]
+        if state == "speaking":
+            waiting_turn_id = 0
+            _cancel_bridge_task()
+
+    @session.on("conversation_item_added")
+    def _on_conversation_item_added(event) -> None:
+        nonlocal waiting_turn_id
+        item = getattr(event, "item", None)
+        role = getattr(item, "role", None)
         if role == "assistant":
             waiting_turn_id = 0
             _cancel_bridge_task()
