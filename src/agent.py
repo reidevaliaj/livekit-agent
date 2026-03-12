@@ -42,12 +42,6 @@ LLM_MODEL = os.getenv("LLM_MODEL", "gpt-4.1-mini").strip() or "gpt-4.1-mini"
 ENABLE_LLM_WARMUP = os.getenv("ENABLE_LLM_WARMUP", "false").strip().lower() == "true"
 LLM_WARMUP_TIMEOUT_SEC = float(os.getenv("LLM_WARMUP_TIMEOUT_SEC", "3.5").strip() or "3.5")
 LLM_WARMUP_MODEL = os.getenv("LLM_WARMUP_MODEL", "gpt-4.1-nano").strip() or "gpt-4.1-nano"
-REQUIRE_EXPLICIT_END_CONFIRMATION = (
-    os.getenv("REQUIRE_EXPLICIT_END_CONFIRMATION", "true").strip().lower() == "true"
-)
-ALLOW_COMPLETION_AUTO_END = (
-    os.getenv("ALLOW_COMPLETION_AUTO_END", "false").strip().lower() == "true"
-)
 
 def _best_effort_caller_id(room: rtc.Room) -> Optional[str]:
     try:
@@ -167,166 +161,6 @@ def _history_messages(session: AgentSession) -> list[Any]:
     return list(messages or [])
 
 
-def _last_user_message_text(session: Optional[AgentSession]) -> str:
-    if session is None:
-        return ""
-    try:
-        for msg in reversed(_history_messages(session)):
-            if getattr(msg, "role", None) != "user":
-                continue
-            return _flatten_message_content(getattr(msg, "content", "")).strip()
-    except Exception:
-        pass
-    return ""
-
-
-def _recent_user_text(session: Optional[AgentSession], limit: int = 4) -> str:
-    if session is None or limit <= 0:
-        return ""
-    collected: list[str] = []
-    try:
-        for msg in reversed(_history_messages(session)):
-            if getattr(msg, "role", None) != "user":
-                continue
-            txt = _flatten_message_content(getattr(msg, "content", "")).strip()
-            if txt:
-                collected.append(txt.lower())
-            if len(collected) >= limit:
-                break
-    except Exception:
-        return ""
-    return " | ".join(collected)
-
-
-def _user_explicitly_wants_to_end(text: str) -> bool:
-    t = (text or "").strip().lower()
-    if not t:
-        return False
-    end_markers = (
-        "bye",
-        "goodbye",
-        "that is all",
-        "that's all",
-        "all good",
-        "all set",
-        "thanks bye",
-        "thank you bye",
-        "end call",
-        "you can end",
-        "we are done",
-        "i am done",
-        "we can stop",
-        "call is over",
-        "hang up",
-        "see you",
-        "take care",
-        "ciao",
-        "adios",
-    )
-    return any(marker in t for marker in end_markers)
-
-
-def _user_gave_closing_signal(session: Optional[AgentSession]) -> bool:
-    recent = _recent_user_text(session, limit=4)
-    if not recent:
-        return False
-    strong_markers = (
-        "goodbye",
-        "bye",
-        "that's all",
-        "that is all",
-        "you can end",
-        "we are done",
-        "end call",
-        "hang up",
-        "take care",
-        "see you",
-    )
-    if any(marker in recent for marker in strong_markers):
-        return True
-    # Softer closing intent that should count only at end-of-conversation phases.
-    soft_markers = (
-        "thank you",
-        "thanks",
-        "great thanks",
-        "perfect thanks",
-        "okay thanks",
-        "ok thanks",
-        "nothing else",
-        "nope",
-        "that's it",
-        "that is it",
-        "no, that's all",
-        "no that is all",
-    )
-    if any(marker in recent for marker in soft_markers):
-        return True
-    # Common end-of-call answer after assistant asks "Anything else?"
-    no_only_markers = ("no", "no.", "no,")
-    segments = [s.strip() for s in recent.split("|") if s.strip()]
-    if any(seg in no_only_markers for seg in segments):
-        return True
-    return False
-
-
-def _call_type_kind(call_type: str) -> str:
-    t = (call_type or "").strip().lower()
-    if "vendor" in t or "solicitation" in t:
-        return "vendor"
-    if "meeting" in t:
-        return "meeting"
-    if "support" in t:
-        return "support"
-    if "sales" in t or "lead" in t:
-        return "sales"
-    if "unrelated" in t or "offtopic" in t or "off-topic" in t:
-        return "unrelated"
-    return "other"
-
-
-def _has_policy_end_reason(topic: str, notes: str) -> bool:
-    combined = f"{topic or ''} {notes or ''}".lower()
-    # Policy-based endings we explicitly want to allow:
-    # - pushy vendor after refusal
-    # - repeated unrelated requests after refusal
-    markers = (
-        "pushy",
-        "repeated",
-        "kept asking",
-        "keeps asking",
-        "after refusal",
-        "not related to our business",
-        "unrelated",
-        "off topic",
-        "off-topic",
-        "vendor solicitation",
-    )
-    return any(marker in combined for marker in markers)
-
-
-def _has_minimum_details_for_completion(
-    call_type: str,
-    name: str,
-    contact_email: str,
-    contact_phone: str,
-    topic: str,
-    notes: str,
-    preferred_time_window: str,
-) -> bool:
-    kind = _call_type_kind(call_type)
-    has_contact = bool((contact_email or "").strip() or (contact_phone or "").strip())
-    has_subject = bool((topic or "").strip() or (notes or "").strip())
-    has_name = bool((name or "").strip())
-
-    if kind in ("sales", "support"):
-        return has_name and has_contact and has_subject
-    if kind == "meeting":
-        return has_contact and bool((preferred_time_window or "").strip() or has_subject)
-    if kind in ("vendor", "unrelated"):
-        return has_policy_end_reason(topic, notes)
-    return has_contact and has_subject
-
-
 def _build_transcript_payload(
     session: AgentSession, room: rtc.Room, shutdown_reason: str
 ) -> Dict[str, Any]:
@@ -439,9 +273,10 @@ Rules:
   politely decline and steer back to business-related requests only.
 - If they keep pushing unrelated requests after refusal, politely end the call.
 - Call call_end only when one of these is true:
-  1) user clearly indicates they want to end (goodbye/that's all/you can end),
-  2) policy ending case (pushy vendor or repeated unrelated requests after refusal),
-  3) required details are collected AND user gives a closing signal (e.g. thanks/okay perfect/thank you).
+  1) minimum contact details are captured and both sides are clearly closing the conversation,
+  2) sales/vendor solicitation call where the caller stays pushy after refusal,
+  3) unrelated conversation where caller stays pushy after refusal.
+- When you decide to call call_end, provide clear topic/notes context about which ending reason applies.
 
 Call context:
 """.strip()
@@ -534,42 +369,49 @@ Call context:
             ctx: JobContext = get_job_context()
             room = ctx.room
             session_obj = getattr(context, "session", None)
-            last_user_text = _last_user_message_text(session_obj)
-            explicit_end_requested = _user_explicitly_wants_to_end(last_user_text)
-            closing_signal = _user_gave_closing_signal(session_obj)
-            policy_end_reason = _has_policy_end_reason(topic, notes)
-            minimum_details_ok = _has_minimum_details_for_completion(
-                call_type=call_type,
-                name=name,
-                contact_email=contact_email,
-                contact_phone=contact_phone,
-                topic=topic,
-                notes=notes,
-                preferred_time_window=preferred_time_window,
-            )
+            transcript = ""
+            messages: list[Dict[str, Any]] = []
+            if session_obj is not None:
+                try:
+                    history_payload = _build_transcript_payload(
+                        session=session_obj,
+                        room=room,
+                        shutdown_reason="call_end_requested",
+                    )
+                    transcript = history_payload.get("transcript", "")
+                    messages = history_payload.get("messages", [])
+                except Exception:
+                    logger.exception("[CALL_END_TOOL] failed to collect transcript context")
+
+            validation_payload = {
+                "tenant_id": TENANT_ID,
+                "call_type": call_type,
+                "name": name,
+                "company": company,
+                "contact_email": contact_email,
+                "contact_phone": contact_phone,
+                "topic": topic,
+                "notes": notes,
+                "urgency": urgency,
+                "preferred_time_window": preferred_time_window,
+                "room_name": room.name if room else None,
+                "caller_id": _best_effort_caller_id(room) if room else None,
+                "timestamp": int(time.time()),
+                "transcript": transcript,
+                "messages": messages,
+            }
+            decision = await _post_json_and_read("/tools/validate-call-end", validation_payload)
+            end_call = bool(decision.get("end_call", 0))
             logger.info(
-                "[CALL_END_TOOL] requested call_type=%s explicit_end=%s closing_signal=%s policy_end=%s minimum_details=%s auto_completion=%s last_user=%r",
-                call_type,
-                explicit_end_requested,
-                closing_signal,
-                policy_end_reason,
-                minimum_details_ok,
-                ALLOW_COMPLETION_AUTO_END,
-                (last_user_text[:180] if last_user_text else ""),
+                "[CALL_END_TOOL] validator end_call=%s rule=%s reason=%s",
+                end_call,
+                decision.get("matched_rule", ""),
+                decision.get("decision_reason", ""),
             )
-            allow_end = (
-                explicit_end_requested
-                or policy_end_reason
-                or (minimum_details_ok and closing_signal)
-                or (ALLOW_COMPLETION_AUTO_END and minimum_details_ok)
-            )
-            if REQUIRE_EXPLICIT_END_CONFIRMATION and not allow_end:
-                logger.warning(
-                    "[CALL_END_TOOL] blocked: missing closing signal/policy reason and auto completion disabled"
-                )
+            if not end_call:
                 return (
-                    "I can keep helping. If you want to end now, say 'that's all', 'goodbye', or 'thanks, that's all'. "
-                    "If this is a pushy vendor or repeated unrelated request, I can end with that reason."
+                    "I can keep helping. If you want to finish now, please say a clear ending like "
+                    "'that's all, thank you' or 'goodbye'."
                 )
 
             payload = {
