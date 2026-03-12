@@ -49,6 +49,9 @@ BRIDGE_FILLER_MAX_PER_CALL = int(os.getenv("BRIDGE_FILLER_MAX_PER_CALL", "2").st
 REQUIRE_EXPLICIT_END_CONFIRMATION = (
     os.getenv("REQUIRE_EXPLICIT_END_CONFIRMATION", "true").strip().lower() == "true"
 )
+ALLOW_COMPLETION_AUTO_END = (
+    os.getenv("ALLOW_COMPLETION_AUTO_END", "false").strip().lower() == "true"
+)
 
 def _best_effort_caller_id(room: rtc.Room) -> Optional[str]:
     try:
@@ -477,17 +480,22 @@ Call context:
                 preferred_time_window=preferred_time_window,
             )
             logger.info(
-                "[CALL_END_TOOL] requested call_type=%s explicit_end=%s policy_end=%s minimum_details=%s last_user=%r",
+                "[CALL_END_TOOL] requested call_type=%s explicit_end=%s policy_end=%s minimum_details=%s auto_completion=%s last_user=%r",
                 call_type,
                 explicit_end_requested,
                 policy_end_reason,
                 minimum_details_ok,
+                ALLOW_COMPLETION_AUTO_END,
                 (last_user_text[:180] if last_user_text else ""),
             )
-            allow_end = explicit_end_requested or policy_end_reason or minimum_details_ok
+            allow_end = (
+                explicit_end_requested
+                or policy_end_reason
+                or (ALLOW_COMPLETION_AUTO_END and minimum_details_ok)
+            )
             if REQUIRE_EXPLICIT_END_CONFIRMATION and not allow_end:
                 logger.warning(
-                    "[CALL_END_TOOL] blocked: missing explicit end, policy reason, or minimum detail completeness"
+                    "[CALL_END_TOOL] blocked: missing explicit end/policy reason (auto completion disabled or incomplete)"
                 )
                 return (
                     "I can keep helping. If you want to end now, say 'that's all' or 'goodbye'. "
