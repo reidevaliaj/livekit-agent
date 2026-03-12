@@ -46,6 +46,9 @@ ENABLE_BRIDGE_FILLER = os.getenv("ENABLE_BRIDGE_FILLER", "true").strip().lower()
 BRIDGE_FILLER_DELAY_SEC = float(os.getenv("BRIDGE_FILLER_DELAY_SEC", "1.5").strip() or "1.5")
 BRIDGE_FILLER_TEXT = os.getenv("BRIDGE_FILLER_TEXT", "So...").strip() or "So..."
 BRIDGE_FILLER_MAX_PER_CALL = int(os.getenv("BRIDGE_FILLER_MAX_PER_CALL", "2").strip() or "2")
+REQUIRE_EXPLICIT_END_CONFIRMATION = (
+    os.getenv("REQUIRE_EXPLICIT_END_CONFIRMATION", "true").strip().lower() == "true"
+)
 
 def _best_effort_caller_id(room: rtc.Room) -> Optional[str]:
     try:
@@ -163,6 +166,98 @@ def _history_messages(session: AgentSession) -> list[Any]:
         else session.history.messages
     )
     return list(messages or [])
+
+
+def _last_user_message_text(session: Optional[AgentSession]) -> str:
+    if session is None:
+        return ""
+    try:
+        for msg in reversed(_history_messages(session)):
+            if getattr(msg, "role", None) != "user":
+                continue
+            return _flatten_message_content(getattr(msg, "content", "")).strip()
+    except Exception:
+        pass
+    return ""
+
+
+def _user_explicitly_wants_to_end(text: str) -> bool:
+    t = (text or "").strip().lower()
+    if not t:
+        return False
+    end_markers = (
+        "bye",
+        "goodbye",
+        "that is all",
+        "that's all",
+        "all good",
+        "all set",
+        "thanks bye",
+        "thank you bye",
+        "end call",
+        "you can end",
+        "we are done",
+        "i am done",
+    )
+    return any(marker in t for marker in end_markers)
+
+
+def _call_type_kind(call_type: str) -> str:
+    t = (call_type or "").strip().lower()
+    if "vendor" in t or "solicitation" in t:
+        return "vendor"
+    if "meeting" in t:
+        return "meeting"
+    if "support" in t:
+        return "support"
+    if "sales" in t or "lead" in t:
+        return "sales"
+    if "unrelated" in t or "offtopic" in t or "off-topic" in t:
+        return "unrelated"
+    return "other"
+
+
+def _has_policy_end_reason(topic: str, notes: str) -> bool:
+    combined = f"{topic or ''} {notes or ''}".lower()
+    # Policy-based endings we explicitly want to allow:
+    # - pushy vendor after refusal
+    # - repeated unrelated requests after refusal
+    markers = (
+        "pushy",
+        "repeated",
+        "kept asking",
+        "keeps asking",
+        "after refusal",
+        "not related to our business",
+        "unrelated",
+        "off topic",
+        "off-topic",
+        "vendor solicitation",
+    )
+    return any(marker in combined for marker in markers)
+
+
+def _has_minimum_details_for_completion(
+    call_type: str,
+    name: str,
+    contact_email: str,
+    contact_phone: str,
+    topic: str,
+    notes: str,
+    preferred_time_window: str,
+) -> bool:
+    kind = _call_type_kind(call_type)
+    has_contact = bool((contact_email or "").strip() or (contact_phone or "").strip())
+    has_subject = bool((topic or "").strip() or (notes or "").strip())
+    has_name = bool((name or "").strip())
+
+    if kind in ("sales", "support"):
+        return has_name and has_contact and has_subject
+    if kind == "meeting":
+        return has_contact and bool((preferred_time_window or "").strip() or has_subject)
+    if kind in ("vendor", "unrelated"):
+        return has_policy_end_reason(topic, notes)
+    return has_contact and has_subject
 
 
 def _build_transcript_payload(
@@ -368,6 +463,37 @@ Call context:
         try:
             ctx: JobContext = get_job_context()
             room = ctx.room
+            session_obj = getattr(context, "session", None)
+            last_user_text = _last_user_message_text(session_obj)
+            explicit_end_requested = _user_explicitly_wants_to_end(last_user_text)
+            policy_end_reason = _has_policy_end_reason(topic, notes)
+            minimum_details_ok = _has_minimum_details_for_completion(
+                call_type=call_type,
+                name=name,
+                contact_email=contact_email,
+                contact_phone=contact_phone,
+                topic=topic,
+                notes=notes,
+                preferred_time_window=preferred_time_window,
+            )
+            logger.info(
+                "[CALL_END_TOOL] requested call_type=%s explicit_end=%s policy_end=%s minimum_details=%s last_user=%r",
+                call_type,
+                explicit_end_requested,
+                policy_end_reason,
+                minimum_details_ok,
+                (last_user_text[:180] if last_user_text else ""),
+            )
+            allow_end = explicit_end_requested or policy_end_reason or minimum_details_ok
+            if REQUIRE_EXPLICIT_END_CONFIRMATION and not allow_end:
+                logger.warning(
+                    "[CALL_END_TOOL] blocked: missing explicit end, policy reason, or minimum detail completeness"
+                )
+                return (
+                    "I can keep helping. If you want to end now, say 'that's all' or 'goodbye'. "
+                    "If this is a pushy vendor or repeated unrelated request, I can end it with that reason."
+                )
+
             payload = {
                 "tenant_id": TENANT_ID,
                 "call_type": call_type,
