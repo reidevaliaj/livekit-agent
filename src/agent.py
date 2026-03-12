@@ -42,10 +42,6 @@ LLM_MODEL = os.getenv("LLM_MODEL", "gpt-4.1-mini").strip() or "gpt-4.1-mini"
 ENABLE_LLM_WARMUP = os.getenv("ENABLE_LLM_WARMUP", "false").strip().lower() == "true"
 LLM_WARMUP_TIMEOUT_SEC = float(os.getenv("LLM_WARMUP_TIMEOUT_SEC", "3.5").strip() or "3.5")
 LLM_WARMUP_MODEL = os.getenv("LLM_WARMUP_MODEL", "gpt-4.1-nano").strip() or "gpt-4.1-nano"
-ENABLE_BRIDGE_FILLER = os.getenv("ENABLE_BRIDGE_FILLER", "true").strip().lower() == "true"
-BRIDGE_FILLER_DELAY_SEC = float(os.getenv("BRIDGE_FILLER_DELAY_SEC", "1.5").strip() or "1.5")
-BRIDGE_FILLER_TEXT = os.getenv("BRIDGE_FILLER_TEXT", "So...").strip() or "So..."
-BRIDGE_FILLER_MAX_PER_CALL = int(os.getenv("BRIDGE_FILLER_MAX_PER_CALL", "2").strip() or "2")
 REQUIRE_EXPLICIT_END_CONFIRMATION = (
     os.getenv("REQUIRE_EXPLICIT_END_CONFIRMATION", "true").strip().lower() == "true"
 )
@@ -184,6 +180,24 @@ def _last_user_message_text(session: Optional[AgentSession]) -> str:
     return ""
 
 
+def _recent_user_text(session: Optional[AgentSession], limit: int = 4) -> str:
+    if session is None or limit <= 0:
+        return ""
+    collected: list[str] = []
+    try:
+        for msg in reversed(_history_messages(session)):
+            if getattr(msg, "role", None) != "user":
+                continue
+            txt = _flatten_message_content(getattr(msg, "content", "")).strip()
+            if txt:
+                collected.append(txt.lower())
+            if len(collected) >= limit:
+                break
+    except Exception:
+        return ""
+    return " | ".join(collected)
+
+
 def _user_explicitly_wants_to_end(text: str) -> bool:
     t = (text or "").strip().lower()
     if not t:
@@ -201,8 +215,58 @@ def _user_explicitly_wants_to_end(text: str) -> bool:
         "you can end",
         "we are done",
         "i am done",
+        "we can stop",
+        "call is over",
+        "hang up",
+        "see you",
+        "take care",
+        "ciao",
+        "adios",
     )
     return any(marker in t for marker in end_markers)
+
+
+def _user_gave_closing_signal(session: Optional[AgentSession]) -> bool:
+    recent = _recent_user_text(session, limit=4)
+    if not recent:
+        return False
+    strong_markers = (
+        "goodbye",
+        "bye",
+        "that's all",
+        "that is all",
+        "you can end",
+        "we are done",
+        "end call",
+        "hang up",
+        "take care",
+        "see you",
+    )
+    if any(marker in recent for marker in strong_markers):
+        return True
+    # Softer closing intent that should count only at end-of-conversation phases.
+    soft_markers = (
+        "thank you",
+        "thanks",
+        "great thanks",
+        "perfect thanks",
+        "okay thanks",
+        "ok thanks",
+        "nothing else",
+        "nope",
+        "that's it",
+        "that is it",
+        "no, that's all",
+        "no that is all",
+    )
+    if any(marker in recent for marker in soft_markers):
+        return True
+    # Common end-of-call answer after assistant asks "Anything else?"
+    no_only_markers = ("no", "no.", "no,")
+    segments = [s.strip() for s in recent.split("|") if s.strip()]
+    if any(seg in no_only_markers for seg in segments):
+        return True
+    return False
 
 
 def _call_type_kind(call_type: str) -> str:
@@ -374,7 +438,10 @@ Rules:
 - If caller asks for content unrelated to our business (e.g., weather, jokes, random trivia):
   politely decline and steer back to business-related requests only.
 - If they keep pushing unrelated requests after refusal, politely end the call.
-- At the end (or when enough info), send call_end event.
+- Call call_end only when one of these is true:
+  1) user clearly indicates they want to end (goodbye/that's all/you can end),
+  2) policy ending case (pushy vendor or repeated unrelated requests after refusal),
+  3) required details are collected AND user gives a closing signal (e.g. thanks/okay perfect/thank you).
 
 Call context:
 """.strip()
@@ -469,6 +536,7 @@ Call context:
             session_obj = getattr(context, "session", None)
             last_user_text = _last_user_message_text(session_obj)
             explicit_end_requested = _user_explicitly_wants_to_end(last_user_text)
+            closing_signal = _user_gave_closing_signal(session_obj)
             policy_end_reason = _has_policy_end_reason(topic, notes)
             minimum_details_ok = _has_minimum_details_for_completion(
                 call_type=call_type,
@@ -480,9 +548,10 @@ Call context:
                 preferred_time_window=preferred_time_window,
             )
             logger.info(
-                "[CALL_END_TOOL] requested call_type=%s explicit_end=%s policy_end=%s minimum_details=%s auto_completion=%s last_user=%r",
+                "[CALL_END_TOOL] requested call_type=%s explicit_end=%s closing_signal=%s policy_end=%s minimum_details=%s auto_completion=%s last_user=%r",
                 call_type,
                 explicit_end_requested,
+                closing_signal,
                 policy_end_reason,
                 minimum_details_ok,
                 ALLOW_COMPLETION_AUTO_END,
@@ -491,15 +560,16 @@ Call context:
             allow_end = (
                 explicit_end_requested
                 or policy_end_reason
+                or (minimum_details_ok and closing_signal)
                 or (ALLOW_COMPLETION_AUTO_END and minimum_details_ok)
             )
             if REQUIRE_EXPLICIT_END_CONFIRMATION and not allow_end:
                 logger.warning(
-                    "[CALL_END_TOOL] blocked: missing explicit end/policy reason (auto completion disabled or incomplete)"
+                    "[CALL_END_TOOL] blocked: missing closing signal/policy reason and auto completion disabled"
                 )
                 return (
-                    "I can keep helping. If you want to end now, say 'that's all' or 'goodbye'. "
-                    "If this is a pushy vendor or repeated unrelated request, I can end it with that reason."
+                    "I can keep helping. If you want to end now, say 'that's all', 'goodbye', or 'thanks, that's all'. "
+                    "If this is a pushy vendor or repeated unrelated request, I can end with that reason."
                 )
 
             payload = {
@@ -567,13 +637,9 @@ async def my_agent(ctx: JobContext):
     ctx.log_context_fields = {"room": ctx.room.name}
     logger.info("[CALL_START] room=%s", ctx.room.name)
     logger.info(
-        "[SESSION_CONFIG] llm_model=%s turn_detector=MultilingualModel preemptive_generation=%s bridge_filler=%s delay=%.2fs text=%s max_per_call=%s",
+        "[SESSION_CONFIG] llm_model=%s turn_detector=MultilingualModel preemptive_generation=%s",
         LLM_MODEL,
         True,
-        ENABLE_BRIDGE_FILLER,
-        BRIDGE_FILLER_DELAY_SEC,
-        BRIDGE_FILLER_TEXT,
-        BRIDGE_FILLER_MAX_PER_CALL,
     )
 
     now_utc = datetime.now(timezone.utc)
@@ -611,92 +677,6 @@ async def my_agent(ctx: JobContext):
             ),
         ),
     )
-
-    bridge_task: Optional[asyncio.Task[Any]] = None
-    waiting_turn_id = 0
-    bridge_sent = 0
-    current_agent_state = "listening"
-
-    def _cancel_bridge_task() -> None:
-        nonlocal bridge_task
-        if bridge_task and not bridge_task.done():
-            bridge_task.cancel()
-        bridge_task = None
-
-    async def _bridge_if_slow(turn_id: int) -> None:
-        nonlocal bridge_sent, waiting_turn_id
-        try:
-            await asyncio.sleep(BRIDGE_FILLER_DELAY_SEC)
-            if not ENABLE_BRIDGE_FILLER:
-                return
-            if turn_id != waiting_turn_id:
-                return
-            if current_agent_state != "thinking":
-                return
-            if bridge_sent >= BRIDGE_FILLER_MAX_PER_CALL:
-                return
-            bridge_sent += 1
-            waiting_turn_id = 0
-            logger.info(
-                "[BRIDGE] sending filler turn=%s count=%s text=%s",
-                turn_id,
-                bridge_sent,
-                BRIDGE_FILLER_TEXT,
-            )
-            await session.say(BRIDGE_FILLER_TEXT)
-        except asyncio.CancelledError:
-            return
-        except Exception:
-            logger.exception("[BRIDGE] filler say failed turn=%s", turn_id)
-
-    @session.on("agent_state_changed")
-    def _on_agent_state_changed(event) -> None:
-        nonlocal waiting_turn_id, bridge_task, current_agent_state
-        raw_state = getattr(event, "new_state", getattr(event, "state", ""))
-        state = str(raw_state).lower().split(".")[-1]
-        current_agent_state = state
-        if state == "thinking":
-            waiting_turn_id += 1
-            _cancel_bridge_task()
-            if ENABLE_BRIDGE_FILLER:
-                bridge_task = asyncio.create_task(_bridge_if_slow(waiting_turn_id))
-                logger.info(
-                    "[BRIDGE] armed turn=%s delay=%.2fs",
-                    waiting_turn_id,
-                    BRIDGE_FILLER_DELAY_SEC,
-                )
-            return
-        if state == "speaking":
-            waiting_turn_id = 0
-            _cancel_bridge_task()
-
-    @session.on("user_state_changed")
-    def _on_user_state_changed(event) -> None:
-        nonlocal waiting_turn_id
-        raw_state = getattr(event, "new_state", getattr(event, "state", ""))
-        state = str(raw_state).lower().split(".")[-1]
-        if state == "speaking":
-            waiting_turn_id = 0
-            _cancel_bridge_task()
-
-    @session.on("conversation_item_added")
-    def _on_conversation_item_added(event) -> None:
-        nonlocal waiting_turn_id
-        item = getattr(event, "item", None)
-        role = getattr(item, "role", None)
-        if role == "assistant":
-            waiting_turn_id = 0
-            _cancel_bridge_task()
-
-    @session.on("speech_created")
-    def _on_speech_created(event) -> None:
-        nonlocal waiting_turn_id
-        source = str(getattr(event, "source", ""))
-        # Cancel bridge only when model/tool response speech is created.
-        # Ignore `say` because that is used for static lines and the filler itself.
-        if source.lower() != "say":
-            waiting_turn_id = 0
-            _cancel_bridge_task()
 
     async def _send_transcript_on_shutdown(reason: str) -> None:
         logger.info("[CALL_END] shutdown callback fired room=%s reason=%s", ctx.room.name, reason)
