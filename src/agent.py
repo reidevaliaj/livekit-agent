@@ -223,6 +223,7 @@ def _format_day_blocks_for_voice(day_blocks: list[Dict[str, Any]]) -> str:
 
 class Assistant(Agent):
     def __init__(self, call_context_text: str) -> None:
+        self._call_end_in_progress = False
         super().__init__(
             instructions=(
                 """
@@ -362,6 +363,11 @@ Call context:
         """
         Use this tool when the call is finished or enough info is collected.
         """
+        if self._call_end_in_progress:
+            logger.warning("[CALL_END_TOOL] call_end already in progress; ignoring duplicate request")
+            return "Ending the call now."
+
+        self._call_end_in_progress = True
         try:
             ctx: JobContext = get_job_context()
             room = ctx.room
@@ -410,8 +416,14 @@ Call context:
             # Always play a short closing line before disconnecting the room.
             if session_obj is not None:
                 try:
-                    await session_obj.say("Thank you for calling Code Studio. Goodbye.")
+                    # Avoid long hangs here; if TTS stalls, we still disconnect promptly.
+                    await asyncio.wait_for(
+                        session_obj.say("Thank you for calling Code Studio. Goodbye."),
+                        timeout=6.0,
+                    )
                     logger.info("[CALL_END_TOOL] farewell spoken before disconnect")
+                except asyncio.TimeoutError:
+                    logger.warning("[CALL_END_TOOL] farewell timed out; disconnecting anyway")
                 except Exception:
                     logger.exception("[CALL_END_TOOL] farewell speak failed; disconnecting anyway")
 
@@ -428,9 +440,11 @@ Call context:
                     logger.exception("[CALL_END_TOOL] ctx.shutdown failed")
 
             return "Saved. I sent the details to the team."
-        except Exception as e:
+        except Exception:
             logger.exception("call_end failed")
-            return f"Failed to send details: {e}"
+            return "I could not finalize that right now, but our team has your details."
+        finally:
+            self._call_end_in_progress = False
 
 
 try:
