@@ -467,16 +467,40 @@ Call context:
                 room_api = getattr(getattr(ctx, "api", None), "room", None)
                 remove_participant = getattr(room_api, "remove_participant", None)
                 if callable(remove_participant):
+                    try:
+                        logger.info(
+                            "[CALL_END_TOOL] remove_participant signature=%s",
+                            str(inspect.signature(remove_participant)),
+                        )
+                    except Exception:
+                        logger.info("[CALL_END_TOOL] remove_participant signature=unavailable")
+
                     for identity in sip_identities:
                         kicked = False
-                        for kwargs in (
-                            {"room": room.name if room else None, "identity": identity},
-                            {"room_name": room.name if room else None, "identity": identity},
-                            {"room": room.name if room else None, "participant_identity": identity},
-                            {"room_name": room.name if room else None, "participant_identity": identity},
-                        ):
+                        room_name = room.name if room else ""
+                        attempts = []
+
+                        # Newer server-sdk style: remove_participant(RoomParticipantIdentity(...))
+                        try:
+                            from livekit.api import RoomParticipantIdentity  # type: ignore
+
+                            attempts.append(lambda: remove_participant(RoomParticipantIdentity(room=room_name, identity=identity)))
+                        except Exception:
+                            pass
+
+                        # Backward-compatible keyword styles.
+                        attempts.extend(
+                            [
+                                lambda: remove_participant(room=room_name, identity=identity),
+                                lambda: remove_participant(room_name=room_name, identity=identity),
+                                lambda: remove_participant(room=room_name, participant_identity=identity),
+                                lambda: remove_participant(room_name=room_name, participant_identity=identity),
+                            ]
+                        )
+
+                        for attempt in attempts:
                             try:
-                                result = remove_participant(**kwargs)
+                                result = attempt()
                                 if inspect.isawaitable(result):
                                     await result
                                 logger.info("[CALL_END_TOOL] kicked SIP participant identity=%s", identity)
@@ -492,16 +516,7 @@ Call context:
                                 break
 
                         if not kicked:
-                            try:
-                                result = remove_participant(room.name if room else None, identity)
-                                if inspect.isawaitable(result):
-                                    await result
-                                logger.info("[CALL_END_TOOL] kicked SIP participant identity=%s", identity)
-                            except Exception:
-                                logger.exception(
-                                    "[CALL_END_TOOL] remove_participant unavailable for identity=%s",
-                                    identity,
-                                )
+                            logger.error("[CALL_END_TOOL] unable to kick SIP participant identity=%s", identity)
                 else:
                     logger.warning("[CALL_END_TOOL] ctx.api.room.remove_participant unavailable; SIP kick skipped")
 
