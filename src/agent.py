@@ -431,6 +431,14 @@ Call context:
             }
             await _post_json("/events/call-end", payload)
 
+            # Always play a short closing line before disconnecting the room.
+            if session_obj is not None:
+                try:
+                    await session_obj.say("Thank you for calling Code Studio. Goodbye.")
+                    logger.info("[CALL_END_TOOL] farewell spoken before disconnect")
+                except Exception:
+                    logger.exception("[CALL_END_TOOL] farewell speak failed; disconnecting anyway")
+
             # Explicitly end the live call once details are saved.
             try:
                 await ctx.room.disconnect()
@@ -443,7 +451,7 @@ Call context:
                 except Exception:
                     logger.exception("[CALL_END_TOOL] ctx.shutdown failed")
 
-            return "Saved. I sent the details to the team. Ending the call now."
+            return "Saved. I sent the details to the team."
         except Exception as e:
             logger.exception("call_end failed")
             return f"Failed to send details: {e}"
