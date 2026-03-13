@@ -2,6 +2,7 @@
 import time
 import logging
 import asyncio
+import inspect
 from datetime import datetime, timedelta, timezone
 from typing import Optional, Dict, Any
 from zoneinfo import ZoneInfo
@@ -413,6 +414,28 @@ Call context:
             }
             await _post_json("/events/call-end", payload)
 
+            # Snapshot SIP participant identities so we can force-kick after agent disconnect.
+            sip_identities: list[str] = []
+            try:
+                for p in room.remote_participants.values():
+                    identity = (p.identity or "").strip()
+                    if not identity:
+                        continue
+                    is_sip = (
+                        p.kind == rtc.ParticipantKind.PARTICIPANT_KIND_SIP
+                        or "sip" in identity.lower()
+                    )
+                    if is_sip:
+                        sip_identities.append(identity)
+                if sip_identities:
+                    logger.info(
+                        "[CALL_END_TOOL] sip participants queued for kick count=%s ids=%s",
+                        len(sip_identities),
+                        sip_identities,
+                    )
+            except Exception:
+                logger.exception("[CALL_END_TOOL] failed to snapshot SIP participants")
+
             # Always play a short closing line before disconnecting the room.
             if session_obj is not None:
                 try:
@@ -438,6 +461,49 @@ Call context:
                     logger.info("[CALL_END_TOOL] ctx.shutdown called")
                 except Exception:
                     logger.exception("[CALL_END_TOOL] ctx.shutdown failed")
+
+            # After disconnecting the agent, force-kick SIP participants if API access is available.
+            if sip_identities:
+                room_api = getattr(getattr(ctx, "api", None), "room", None)
+                remove_participant = getattr(room_api, "remove_participant", None)
+                if callable(remove_participant):
+                    for identity in sip_identities:
+                        kicked = False
+                        for kwargs in (
+                            {"room": room.name if room else None, "identity": identity},
+                            {"room_name": room.name if room else None, "identity": identity},
+                            {"room": room.name if room else None, "participant_identity": identity},
+                            {"room_name": room.name if room else None, "participant_identity": identity},
+                        ):
+                            try:
+                                result = remove_participant(**kwargs)
+                                if inspect.isawaitable(result):
+                                    await result
+                                logger.info("[CALL_END_TOOL] kicked SIP participant identity=%s", identity)
+                                kicked = True
+                                break
+                            except TypeError:
+                                continue
+                            except Exception:
+                                logger.exception(
+                                    "[CALL_END_TOOL] failed to kick SIP participant identity=%s",
+                                    identity,
+                                )
+                                break
+
+                        if not kicked:
+                            try:
+                                result = remove_participant(room.name if room else None, identity)
+                                if inspect.isawaitable(result):
+                                    await result
+                                logger.info("[CALL_END_TOOL] kicked SIP participant identity=%s", identity)
+                            except Exception:
+                                logger.exception(
+                                    "[CALL_END_TOOL] remove_participant unavailable for identity=%s",
+                                    identity,
+                                )
+                else:
+                    logger.warning("[CALL_END_TOOL] ctx.api.room.remove_participant unavailable; SIP kick skipped")
 
             return "Saved. I sent the details to the team."
         except Exception:
