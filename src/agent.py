@@ -249,16 +249,16 @@ Rules:
 - On the caller's first turn, answer in one short sentence, then ask one focused question.
 - Ask only the needed questions.
 - Do not promise prices or timelines.
-- If sales lead: capture name, company, need, best email/phone.
+- If sales lead: capture name, company, need, best email.
 - If caller shows interest in any of our services:
-  give brief, receptionist-level information only, then guide them toward scheduling a meeting with Founder Rey.
+  give brief, receptionist-level information only, then guide them toward scheduling a meeting with Rey which is main developer.
   Do not go into deep technical detail.
-- If support: capture name, company, problem, best contact.
+- If support: capture name, company, problem, best email.
 - When collecting email:
   1) ask caller to spell it slowly if needed,
   2) convert spoken words like "at" -> "@" and "dot" -> ".",
   3) read the final email back and ask explicit confirmation ("Is this correct?").
-- If email remains unclear after two tries, ask for phone as fallback contact.
+- If email remains unclear after two tries no problem leave it at that we will use phone which we already have.
 - If meeting: first ask the caller for their preferred date and time.
 - Then call check_meeting_slot using ISO 8601 datetime with timezone offset.
 - If caller asks for a meeting beyond 2 weeks, say that the responsible person will handle it after the call.
@@ -268,15 +268,12 @@ Rules:
 - If the caller is trying to sell us something (vendor/sales solicitation):
   say we are not interested right now, and that the responsible person will be notified.
   If there is interest later, we will contact them.
-- If a vendor caller is pushy or repeats after refusal, politely end the call.
+- If a vendor caller is pushy or repeats after refusal, politely end the call by calling call_end function.
 - If caller asks for content unrelated to our business (e.g., weather, jokes, random trivia):
   politely decline and steer back to business-related requests only.
-- If they keep pushing unrelated requests after refusal, politely end the call.
-- Call call_end only when one of these is true:
-  1) minimum contact details are captured and both sides are clearly closing the conversation,
-  2) sales/vendor solicitation call where the caller stays pushy after refusal,
-  3) unrelated conversation where caller stays pushy after refusal.
-- When you decide to call call_end, provide clear topic/notes context about which ending reason applies.
+- If they keep pushing unrelated requests after refusal, politely end the call by calling call_end function.
+- IF the call is finished you have got the infomation needed or the caller has got the information needed for them. Wich them a nice day if their response after that has no further requests call call_end function
+- When you decide to call call_end, just call it.
 
 Call context:
 """.strip()
@@ -370,7 +367,6 @@ Call context:
             room = ctx.room
             session_obj = getattr(context, "session", None)
             transcript = ""
-            messages: list[Dict[str, Any]] = []
             if session_obj is not None:
                 try:
                     history_payload = _build_transcript_payload(
@@ -379,35 +375,15 @@ Call context:
                         shutdown_reason="call_end_requested",
                     )
                     transcript = history_payload.get("transcript", "")
-                    messages = history_payload.get("messages", [])
                 except Exception:
                     logger.exception("[CALL_END_TOOL] failed to collect transcript context")
 
             validation_payload = {
-                "tenant_id": TENANT_ID,
-                "call_type": call_type,
-                "name": name,
-                "company": company,
-                "contact_email": contact_email,
-                "contact_phone": contact_phone,
-                "topic": topic,
-                "notes": notes,
-                "urgency": urgency,
-                "preferred_time_window": preferred_time_window,
-                "room_name": room.name if room else None,
-                "caller_id": _best_effort_caller_id(room) if room else None,
-                "timestamp": int(time.time()),
                 "transcript": transcript,
-                "messages": messages,
             }
             decision = await _post_json_and_read("/tools/validate-call-end", validation_payload)
             end_call = bool(decision.get("end_call", 0))
-            logger.info(
-                "[CALL_END_TOOL] validator end_call=%s rule=%s reason=%s",
-                end_call,
-                decision.get("matched_rule", ""),
-                decision.get("decision_reason", ""),
-            )
+            logger.info("[CALL_END_TOOL] validator end_call=%s", end_call)
             if not end_call:
                 return (
                     "I can keep helping. If you want to finish now, please say a clear ending like "
