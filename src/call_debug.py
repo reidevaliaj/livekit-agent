@@ -62,7 +62,7 @@ class CallDebugLogger:
         if value is None:
             return "null"
         if isinstance(value, str):
-            return json.dumps(value, ensure_ascii=False)
+            return json.dumps(self._shorten(value), ensure_ascii=False)
         if isinstance(value, (int, float, bool)):
             return json.dumps(value)
 
@@ -80,3 +80,8 @@ class CallDebugLogger:
             return json.dumps(value, ensure_ascii=False, default=str)
         except Exception:
             return json.dumps(repr(value), ensure_ascii=False)
+
+    def _shorten(self, value: str, limit: int = 400) -> str:
+        if len(value) <= limit:
+            return value
+        return value[: limit - 3] + "..."

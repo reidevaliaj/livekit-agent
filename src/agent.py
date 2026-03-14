@@ -116,6 +116,12 @@ def _flatten_message_content(content: Any) -> str:
 def _event_text_payload(value: Any) -> str:
     if value is None:
         return ""
+    transcript = getattr(value, "transcript", None)
+    if isinstance(transcript, str):
+        return transcript.strip()
+    text = getattr(value, "text", None)
+    if isinstance(text, str):
+        return text.strip()
     if hasattr(value, "content"):
         return _flatten_message_content(getattr(value, "content"))
     return _flatten_message_content(value)
@@ -692,7 +698,7 @@ async def my_agent(ctx: JobContext):
         if new_state.lower().endswith("listening"):
             debug_logger.log(
                 "turn",
-                "user_finished_speaking",
+                "USER_STOPPED_SPEAKING",
                 old_state=old_state,
                 new_state=new_state,
             )
@@ -708,11 +714,13 @@ async def my_agent(ctx: JobContext):
 
     @session.on("user_input_transcribed")
     def _on_user_input_transcribed(ev: Any) -> None:
+        text = _event_text_payload(ev)
+        if not text:
+            return
         debug_logger.log(
             "transcript",
-            "user_input_transcribed",
-            is_final=bool(getattr(ev, "is_final", False)),
-            text=_event_text_payload(ev),
+            "USER_FINAL" if bool(getattr(ev, "is_final", False)) else "USER_PARTIAL",
+            text=text,
         )
 
     @session.on("conversation_item_added")
@@ -723,8 +731,7 @@ async def my_agent(ctx: JobContext):
         if role in ("user", "assistant") and text:
             debug_logger.log(
                 "transcript",
-                "conversation_item_added",
-                role=role,
+                "USER_COMMITTED" if role == "user" else "ASSISTANT_COMMITTED",
                 text=text,
             )
 
@@ -737,15 +744,20 @@ async def my_agent(ctx: JobContext):
                     debug_logger.log("tool", "function_tools_executed", index=idx, payload=pair)
                     continue
                 function_call, function_output = pair
+                call_name = str(getattr(function_call, "name", ""))
+                arguments = str(getattr(function_call, "arguments", ""))
+                output_text = str(getattr(function_output, "output", ""))
                 debug_logger.log(
                     "tool",
-                    "function_tools_executed",
+                    "TOOL_EXECUTED",
                     index=idx,
-                    function_call=function_call,
-                    function_output=function_output,
+                    name=call_name,
+                    arguments=arguments,
+                    output=output_text,
+                    is_error=bool(getattr(function_output, "is_error", False)),
                 )
             return
-        debug_logger.log("tool", "function_tools_executed", payload=ev)
+        debug_logger.log("tool", "TOOL_EXECUTED", payload=ev)
 
     async def _send_transcript_on_shutdown(reason: str) -> None:
         logger.info("[CALL_END] shutdown callback fired room=%s reason=%s", ctx.room.name, reason)
