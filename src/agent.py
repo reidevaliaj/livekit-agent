@@ -25,6 +25,8 @@ from livekit.agents import (
 from livekit.plugins import noise_cancellation, silero, deepgram, cartesia, openai
 from livekit.plugins.turn_detector.multilingual import MultilingualModel
 
+from call_debug import CallDebugLogger
+
 logger = logging.getLogger("agent")
 logging.basicConfig(level=logging.INFO)
 
@@ -109,6 +111,14 @@ def _flatten_message_content(content: Any) -> str:
                 continue
         return " ".join(parts).strip()
     return str(content)
+
+
+def _event_text_payload(value: Any) -> str:
+    if value is None:
+        return ""
+    if hasattr(value, "content"):
+        return _flatten_message_content(getattr(value, "content"))
+    return _flatten_message_content(value)
 
 
 async def _warmup_llm_once() -> None:
@@ -223,8 +233,13 @@ def _format_day_blocks_for_voice(day_blocks: list[Dict[str, Any]]) -> str:
 
 
 class Assistant(Agent):
-    def __init__(self, call_context_text: str) -> None:
+    def __init__(
+        self,
+        call_context_text: str,
+        debug_logger: Optional[CallDebugLogger] = None,
+    ) -> None:
         self._call_end_in_progress = False
+        self._debug_logger = debug_logger
         super().__init__(
             instructions=(
                 """
@@ -284,6 +299,11 @@ Call context:
             )
         )
 
+    def _debug_log(self, category: str, event: str, **fields: Any) -> None:
+        if self._debug_logger is None:
+            return
+        self._debug_logger.log(category, event, **fields)
+
     @function_tool
     async def check_meeting_slot(
         self,
@@ -296,6 +316,12 @@ Call context:
         preferred_start_iso must be ISO 8601 with timezone offset.
         """
         try:
+            self._debug_log(
+                "tool",
+                "check_meeting_slot.start",
+                preferred_start_iso=preferred_start_iso,
+                duration_minutes=duration_minutes,
+            )
             payload = {
                 "tenant_id": TENANT_ID,
                 "preferred_start_iso": preferred_start_iso,
@@ -303,14 +329,19 @@ Call context:
                 "alternatives_limit": 3,
             }
             data = await _post_json_and_read("/tools/check-meeting-slot", payload)
+            self._debug_log("tool", "check_meeting_slot.backend_response", data=data)
             status = str(data.get("status", "")) if isinstance(data, dict) else ""
 
             if status == "free":
                 confirmed = data.get("confirmed_slot", {}) if isinstance(data, dict) else {}
                 spoken = _format_slot_for_voice(confirmed) if isinstance(confirmed, dict) else ""
                 if spoken:
-                    return f"That time is available. We can confirm: {spoken}."
-                return "That time is available. We can confirm it."
+                    result_text = f"That time is available. We can confirm: {spoken}."
+                    self._debug_log("tool", "check_meeting_slot.result", result=result_text)
+                    return result_text
+                result_text = "That time is available. We can confirm it."
+                self._debug_log("tool", "check_meeting_slot.result", result=result_text)
+                return result_text
 
             if status in ("busy", "outside_hours"):
                 next_slots = data.get("next_slots", []) if isinstance(data, dict) else []
@@ -321,31 +352,47 @@ Call context:
                         lines.append(f"{idx}) {spoken}")
                 if lines:
                     if status == "busy":
-                        return "That time is not available. Next available options are: " + " ; ".join(lines)
-                    return "That time is outside business hours. Available options are: " + " ; ".join(lines)
+                        result_text = "That time is not available. Next available options are: " + " ; ".join(lines)
+                        self._debug_log("tool", "check_meeting_slot.result", result=result_text)
+                        return result_text
+                    result_text = "That time is outside business hours. Available options are: " + " ; ".join(lines)
+                    self._debug_log("tool", "check_meeting_slot.result", result=result_text)
+                    return result_text
 
                 day_blocks = data.get("day_blocks", []) if isinstance(data, dict) else []
                 block_txt = _format_day_blocks_for_voice(day_blocks if isinstance(day_blocks, list) else [])
                 if block_txt:
-                    return "I cannot use that exact time. Available blocks are: " + block_txt
-                return "I cannot use that exact time right now. Please suggest another time in the next two weeks."
+                    result_text = "I cannot use that exact time. Available blocks are: " + block_txt
+                    self._debug_log("tool", "check_meeting_slot.result", result=result_text)
+                    return result_text
+                result_text = "I cannot use that exact time right now. Please suggest another time in the next two weeks."
+                self._debug_log("tool", "check_meeting_slot.result", result=result_text)
+                return result_text
 
             if status == "outside_horizon":
-                return (
+                result_text = (
                     "That request is outside the next two weeks. "
                     "The responsible person will handle it after this call."
                 )
+                self._debug_log("tool", "check_meeting_slot.result", result=result_text)
+                return result_text
 
             if status == "unavailable":
-                return (
+                result_text = (
                     "I cannot reach live calendar availability right now. "
                     "Please share your preferred time and our team will confirm after this call."
                 )
+                self._debug_log("tool", "check_meeting_slot.result", result=result_text)
+                return result_text
 
-            return "Please provide your preferred date and time in the next two weeks."
+            result_text = "Please provide your preferred date and time in the next two weeks."
+            self._debug_log("tool", "check_meeting_slot.result", result=result_text)
+            return result_text
         except Exception as e:
             logger.exception("check_meeting_slot failed")
-            return f"I could not check that slot right now: {e}"
+            result_text = f"I could not check that slot right now: {e}"
+            self._debug_log("tool", "check_meeting_slot.error", error=str(e), result=result_text)
+            return result_text
 
     @function_tool
     async def call_end(
@@ -366,10 +413,24 @@ Call context:
         """
         if self._call_end_in_progress:
             logger.warning("[CALL_END_TOOL] call_end already in progress; ignoring duplicate request")
+            self._debug_log("tool", "call_end.duplicate", call_type=call_type)
             return "Ending the call now."
 
         self._call_end_in_progress = True
         try:
+            self._debug_log(
+                "tool",
+                "call_end.start",
+                call_type=call_type,
+                name=name,
+                company=company,
+                contact_email=contact_email,
+                contact_phone=contact_phone,
+                topic=topic,
+                notes=notes,
+                urgency=urgency,
+                preferred_time_window=preferred_time_window,
+            )
             ctx: JobContext = get_job_context()
             room = ctx.room
             session_obj = getattr(context, "session", None)
@@ -389,13 +450,16 @@ Call context:
                 "transcript": transcript,
             }
             decision = await _post_json_and_read("/tools/validate-call-end", validation_payload)
+            self._debug_log("tool", "call_end.validation_response", decision=decision)
             end_call = bool(decision.get("end_call", 0))
             logger.info("[CALL_END_TOOL] validator end_call=%s", end_call)
             if not end_call:
-                return (
+                result_text = (
                     "I can keep helping. If you want to finish now, please say a clear ending like "
                     "'that's all, thank you' or 'goodbye'."
                 )
+                self._debug_log("tool", "call_end.result", result=result_text)
+                return result_text
 
             payload = {
                 "tenant_id": TENANT_ID,
@@ -412,6 +476,7 @@ Call context:
                 "caller_id": _best_effort_caller_id(room) if room else None,
                 "timestamp": int(time.time()),
             }
+            self._debug_log("tool", "call_end.event_payload", payload=payload)
             await _post_json("/events/call-end", payload)
 
             # Snapshot SIP participant identities so we can force-kick after agent disconnect.
@@ -520,10 +585,14 @@ Call context:
                 else:
                     logger.warning("[CALL_END_TOOL] ctx.api.room.remove_participant unavailable; SIP kick skipped")
 
-            return "Saved. I sent the details to the team."
-        except Exception:
+            result_text = "Saved. I sent the details to the team."
+            self._debug_log("tool", "call_end.result", result=result_text)
+            return result_text
+        except Exception as e:
             logger.exception("call_end failed")
-            return "I could not finalize that right now, but our team has your details."
+            result_text = "I could not finalize that right now, but our team has your details."
+            self._debug_log("tool", "call_end.error", error=str(e), result=result_text)
+            return result_text
         finally:
             self._call_end_in_progress = False
 
@@ -571,6 +640,14 @@ async def my_agent(ctx: JobContext):
         f"Current business local time ({BUSINESS_TIMEZONE}): {now_local.isoformat()}\n"
         f"Meeting booking horizon ends at ({BUSINESS_TIMEZONE}): {two_weeks_local.isoformat()}"
     )
+    debug_logger = CallDebugLogger()
+    debug_logger.log(
+        "call",
+        "session_started",
+        room_name=ctx.room.name,
+        business_timezone=BUSINESS_TIMEZONE,
+        llm_model=LLM_MODEL,
+    )
 
     session = AgentSession(
         stt=deepgram.STT(model="nova-3", language="multi"),
@@ -585,7 +662,10 @@ async def my_agent(ctx: JobContext):
     )
 
     await session.start(
-        agent=Assistant(call_context_text=call_context_text),
+        agent=Assistant(
+            call_context_text=call_context_text,
+            debug_logger=debug_logger,
+        ),
         room=ctx.room,
         room_options=room_io.RoomOptions(
             audio_input=room_io.AudioInputOptions(
@@ -599,8 +679,77 @@ async def my_agent(ctx: JobContext):
         ),
     )
 
+    @session.on("user_state_changed")
+    def _on_user_state_changed(ev: Any) -> None:
+        old_state = str(getattr(ev, "old_state", ""))
+        new_state = str(getattr(ev, "new_state", ""))
+        debug_logger.log(
+            "turn",
+            "user_state_changed",
+            old_state=old_state,
+            new_state=new_state,
+        )
+        if new_state.lower().endswith("listening"):
+            debug_logger.log(
+                "turn",
+                "user_finished_speaking",
+                old_state=old_state,
+                new_state=new_state,
+            )
+
+    @session.on("agent_state_changed")
+    def _on_agent_state_changed(ev: Any) -> None:
+        debug_logger.log(
+            "agent",
+            "agent_state_changed",
+            old_state=str(getattr(ev, "old_state", "")),
+            new_state=str(getattr(ev, "new_state", "")),
+        )
+
+    @session.on("user_input_transcribed")
+    def _on_user_input_transcribed(ev: Any) -> None:
+        debug_logger.log(
+            "transcript",
+            "user_input_transcribed",
+            is_final=bool(getattr(ev, "is_final", False)),
+            text=_event_text_payload(ev),
+        )
+
+    @session.on("conversation_item_added")
+    def _on_conversation_item_added(ev: Any) -> None:
+        item = getattr(ev, "item", None)
+        role = str(getattr(item, "role", ""))
+        text = _event_text_payload(item).strip()
+        if role in ("user", "assistant") and text:
+            debug_logger.log(
+                "transcript",
+                "conversation_item_added",
+                role=role,
+                text=text,
+            )
+
+    @session.on("function_tools_executed")
+    def _on_function_tools_executed(ev: Any) -> None:
+        zipped = getattr(ev, "zipped", None)
+        if callable(zipped):
+            for idx, pair in enumerate(zipped(), start=1):
+                if not isinstance(pair, tuple) or len(pair) != 2:
+                    debug_logger.log("tool", "function_tools_executed", index=idx, payload=pair)
+                    continue
+                function_call, function_output = pair
+                debug_logger.log(
+                    "tool",
+                    "function_tools_executed",
+                    index=idx,
+                    function_call=function_call,
+                    function_output=function_output,
+                )
+            return
+        debug_logger.log("tool", "function_tools_executed", payload=ev)
+
     async def _send_transcript_on_shutdown(reason: str) -> None:
         logger.info("[CALL_END] shutdown callback fired room=%s reason=%s", ctx.room.name, reason)
+        debug_logger.log("call", "shutdown_started", room_name=ctx.room.name, reason=reason)
 
         try:
             payload = _build_transcript_payload(
@@ -630,6 +779,9 @@ async def my_agent(ctx: JobContext):
                 ctx.room.name,
                 reason,
             )
+        finally:
+            debug_logger.log("call", "shutdown_finished", room_name=ctx.room.name, reason=reason)
+            debug_logger.close(cleanup=True)
 
     ctx.add_shutdown_callback(_send_transcript_on_shutdown)
 
