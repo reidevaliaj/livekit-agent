@@ -79,6 +79,12 @@ LANGUAGE_LABELS = {
     "de": "German",
 }
 
+FAREWELL_BY_LANGUAGE = {
+    "en": "Thank you for calling {business_name}. Goodbye.",
+    "it": "Grazie per aver chiamato {business_name}. Arrivederci.",
+    "de": "Vielen Dank fuer Ihren Anruf bei {business_name}. Auf Wiedersehen.",
+}
+
 
 def _best_effort_caller_id(room: rtc.Room) -> Optional[str]:
     try:
@@ -368,12 +374,17 @@ class Assistant(Agent):
         self._debug_logger = debug_logger
         self._tenant_id = str(session_config["tenant"]["id"])
         self._business_name = str(session_config["config"].get("business_name") or session_config["tenant"].get("display_name") or "the business")
+        self._assistant_language = str(session_config["config"].get("assistant_language") or "en").strip().lower() or "en"
         instructions = _build_instructions(session_config, call_context_text)
         super().__init__(instructions=instructions)
 
     def _debug_log(self, category: str, event: str, **fields: Any) -> None:
         if self._debug_logger is not None:
             self._debug_logger.log(category, event, **fields)
+
+    def _farewell_text(self) -> str:
+        template = FAREWELL_BY_LANGUAGE.get(self._assistant_language, FAREWELL_BY_LANGUAGE["en"])
+        return template.format(business_name=self._business_name)
 
     @function_tool
     async def check_meeting_slot(self, context: RunContext, preferred_start_iso: str, duration_minutes: int = 30) -> str:
@@ -476,7 +487,7 @@ class Assistant(Agent):
 
             if session_obj is not None:
                 try:
-                    await asyncio.wait_for(session_obj.say(f"Thank you for calling {self._business_name}. Goodbye."), timeout=6.0)
+                    await asyncio.wait_for(session_obj.say(self._farewell_text()), timeout=6.0)
                     logger.info("[CALL_END_TOOL] farewell spoken before disconnect")
                 except asyncio.TimeoutError:
                     logger.warning("[CALL_END_TOOL] farewell timed out; disconnecting anyway")
