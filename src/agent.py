@@ -58,7 +58,10 @@ Rules:
 - Ask only the next needed question.
 - Collect name.
 - Use check_meeting_slot before confirming any meeting inside the booking horizon.
+- Only say a meeting is booked or confirmed when check_meeting_slot returns that the slot is available.
+- If check_meeting_slot says the slot is unavailable, busy, outside hours, or live calendar access is unavailable, clearly say the meeting is not booked yet.
 - Never invent availability or time slots.
+- If the caller says there is nothing else they need, or says goodbye/thanks after the conversation is complete, call call_end immediately.
 - If you have enough information, ask if the caller needs anything else. If not, end politely and call call_end.
 - For unrelated or persistent vendor calls, politely decline and end the call if they continue.
 """.strip()
@@ -400,7 +403,7 @@ class Assistant(Agent):
             if status == "free":
                 confirmed = data.get("confirmed_slot", {}) if isinstance(data, dict) else {}
                 spoken = _format_slot_for_voice(confirmed) if isinstance(confirmed, dict) else ""
-                result_text = f"That time is available. We can confirm: {spoken}." if spoken else "That time is available. We can confirm it."
+                result_text = f"AVAILABLE. Confirm exactly this slot: {spoken}." if spoken else "AVAILABLE. Confirm the requested slot."
                 self._debug_log("tool", "check_meeting_slot.result", result=result_text)
                 return result_text
             if status in ("busy", "outside_hours"):
@@ -411,23 +414,23 @@ class Assistant(Agent):
                     if spoken:
                         lines.append(f"{idx}) {spoken}")
                 if lines:
-                    result_text = ("That time is not available. Next available options are: " + " ; ".join(lines) if status == "busy" else "That time is outside business hours. Available options are: " + " ; ".join(lines))
+                    result_text = ("NOT AVAILABLE. Do not confirm the requested slot. Offer only these alternatives: " + " ; ".join(lines) if status == "busy" else "OUTSIDE BUSINESS HOURS. Do not confirm the requested slot. Offer only these alternatives: " + " ; ".join(lines))
                     self._debug_log("tool", "check_meeting_slot.result", result=result_text)
                     return result_text
                 block_txt = _format_day_blocks_for_voice(data.get("day_blocks", []) if isinstance(data, dict) else [])
                 if block_txt:
-                    result_text = "I cannot use that exact time. Available blocks are: " + block_txt
+                    result_text = "NOT AVAILABLE. Do not confirm the requested slot. Available blocks are: " + block_txt
                     self._debug_log("tool", "check_meeting_slot.result", result=result_text)
                     return result_text
-                result_text = "I cannot use that exact time right now. Please suggest another time in the booking window."
+                result_text = "NOT AVAILABLE. Do not confirm the requested slot. Ask for another time in the booking window."
                 self._debug_log("tool", "check_meeting_slot.result", result=result_text)
                 return result_text
             if status == "outside_horizon":
-                result_text = "That request is outside the booking horizon. The responsible person will handle it after this call."
+                result_text = "OUTSIDE HORIZON. Do not confirm any meeting. Explain that the team will handle this request after the call."
                 self._debug_log("tool", "check_meeting_slot.result", result=result_text)
                 return result_text
             if status == "unavailable":
-                result_text = "I cannot reach live calendar availability right now. Please share your preferred time and our team will confirm after this call."
+                result_text = "CALENDAR UNAVAILABLE. Do not confirm or schedule any meeting. You may only note the caller's preferred time and explain that the team will confirm later."
                 self._debug_log("tool", "check_meeting_slot.result", result=result_text)
                 return result_text
             result_text = "Please provide your preferred date and time in the booking window."
