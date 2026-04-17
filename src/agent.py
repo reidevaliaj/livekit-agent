@@ -42,6 +42,7 @@ DEFAULT_TTS_VOICE = (
     os.getenv("DEFAULT_TTS_VOICE", "9626c31c-bec5-4cca-baa8-f8ba9e84c8bc")
     or "9626c31c-bec5-4cca-baa8-f8ba9e84c8bc"
 ).strip()
+DEFAULT_TTS_SPEED = float((os.getenv("DEFAULT_TTS_SPEED", "1.0") or "1.0").strip() or "1.0")
 AGENT_NUM_IDLE_PROCESSES = int(os.getenv("AGENT_NUM_IDLE_PROCESSES", "1").strip() or "1")
 AGENT_LOAD_THRESHOLD = float(os.getenv("AGENT_LOAD_THRESHOLD", "0.95").strip() or "0.95")
 ENABLE_LLM_WARMUP = os.getenv("ENABLE_LLM_WARMUP", "false").strip().lower() == "true"
@@ -49,24 +50,13 @@ LLM_WARMUP_TIMEOUT_SEC = float(os.getenv("LLM_WARMUP_TIMEOUT_SEC", "3.5").strip(
 LLM_WARMUP_MODEL = (os.getenv("LLM_WARMUP_MODEL", "gpt-4.1-nano").strip() or "gpt-4.1-nano")
 
 PLATFORM_RULES = """
-You are the voice receptionist for a client business that uses our shared AI receptionist platform.
-Your job is to understand the call type, answer only with receptionist-level business information, collect the minimum needed details, and decide when to offer a meeting or route follow-up.
-
-Call types:
-1) Sales lead: the caller is interested in the tenant's services or asks business-related pre-sales questions.
-2) Support issue: the caller has a problem with an existing service or project.
-3) Vendor or sales solicitation: the caller is trying to sell something to the tenant.
-4) Unrelated: the request is outside the tenant's business.
-
 Rules:
 - Speak in a warm, business-professional tone.
 - Keep responses short and phone-friendly.
+- If something in the sentence you recive does not make sense or seams not correct ask again kindly.
 - Never offer prices or promise timelines unless the tenant context explicitly says to.
 - Ask only the next needed question.
-- Collect name and email.
-- When collecting email, remember the transcript comes from speech recognition.
-- Always read the email back and ask explicit confirmation.
-- If the email is unclear after two tries, stop forcing it and continue with the call.
+- Collect name.
 - Use check_meeting_slot before confirming any meeting inside the booking horizon.
 - Never invent availability or time slots.
 - If you have enough information, ask if the caller needs anything else. If not, end politely and call call_end.
@@ -84,6 +74,14 @@ FAREWELL_BY_LANGUAGE = {
     "it": "Grazie per aver chiamato {business_name}. Arrivederci.",
     "de": "Vielen Dank fuer Ihren Anruf bei {business_name}. Auf Wiedersehen.",
 }
+
+
+def _normalize_tts_speed(value: Any) -> float:
+    try:
+        speed = float(value if value not in (None, "") else DEFAULT_TTS_SPEED)
+    except (TypeError, ValueError):
+        speed = DEFAULT_TTS_SPEED
+    return min(1.5, max(0.6, speed))
 
 
 def _best_effort_caller_id(room: rtc.Room) -> Optional[str]:
@@ -283,7 +281,7 @@ def _lookup_attr(attrs: dict[str, str], *candidates: str) -> str:
 def _fallback_session_config(room_name: str, caller_id: str) -> dict[str, Any]:
     return {
         "tenant": {"id": DEFAULT_TENANT_ID, "slug": DEFAULT_TENANT_ID, "display_name": "Code Studio", "status": "active", "notes": "Legacy fallback session config"},
-        "config": {"version": 1, "business_name": "Code Studio", "assistant_language": "en", "assistant_language_label": "English", "timezone": DEFAULT_BUSINESS_TIMEZONE, "greeting": "Thanks for calling Code Studio. How may we help you today?", "tenant_prompt": "You are the receptionist for Code Studio. Help callers understand the business, answer with the configured services, and collect accurate lead details.", "services": ["Web Design", "WordPress, TYPO3, Shopify", "Headless CMS", "Web applications", "AI integration and agents creation", "SEO"], "faq_notes": "", "prompt_appendix": "", "business_hours": "09:00-17:00", "business_days": "1,2,3,4,5", "meeting_duration_minutes": 30, "booking_horizon_days": 14, "enabled_tools": {"email_summary": True, "meeting_creation": True, "case_creation": True, "calendar_lookup": True, "zoom_meetings": True}, "llm_model": DEFAULT_LLM_MODEL, "tts_voice": DEFAULT_TTS_VOICE, "owner_name": "Rey", "owner_email": "info@code-studio.eu", "reply_to_email": "Rej Aliaj <info@code-studio.eu>", "from_email": "Code Studio <noreply@code-studio.eu>", "notification_targets": ["info@code-studio.eu"], "extra_settings": {"meeting_owner_email": "aliajrei@gmail.com"}},
+        "config": {"version": 1, "business_name": "Code Studio", "assistant_language": "en", "assistant_language_label": "English", "timezone": DEFAULT_BUSINESS_TIMEZONE, "greeting": "Thanks for calling Code Studio. How may we help you today?", "tenant_prompt": "You are the receptionist for Code Studio. Help callers understand the business, answer with the configured services, and collect accurate lead details.", "services": ["Web Design", "WordPress, TYPO3, Shopify", "Headless CMS", "Web applications", "AI integration and agents creation", "SEO"], "faq_notes": "", "prompt_appendix": "", "business_hours": "09:00-17:00", "business_days": "1,2,3,4,5", "meeting_duration_minutes": 30, "booking_horizon_days": 14, "enabled_tools": {"email_summary": True, "meeting_creation": True, "case_creation": True, "calendar_lookup": True, "zoom_meetings": True}, "llm_model": DEFAULT_LLM_MODEL, "tts_voice": DEFAULT_TTS_VOICE, "tts_speed": DEFAULT_TTS_SPEED, "owner_name": "Rey", "owner_email": "info@code-studio.eu", "reply_to_email": "Rej Aliaj <info@code-studio.eu>", "from_email": "Code Studio <noreply@code-studio.eu>", "notification_targets": ["info@code-studio.eu"], "extra_settings": {"meeting_owner_email": "aliajrei@gmail.com"}},
         "resolved_at": datetime.now(timezone.utc).isoformat(),
         "room_name": room_name,
         "caller_id": caller_id,
@@ -586,16 +584,17 @@ async def my_agent(ctx: JobContext):
     business_timezone = str(config.get("timezone") or DEFAULT_BUSINESS_TIMEZONE)
     llm_model = str(config.get("llm_model") or DEFAULT_LLM_MODEL)
     tts_voice = str(config.get("tts_voice") or DEFAULT_TTS_VOICE)
+    tts_speed = _normalize_tts_speed(config.get("tts_speed"))
     assistant_language = str(config.get("assistant_language") or "en")
     call_context_text = _build_call_context_text(session_config)
 
-    logger.info("[SESSION_CONFIG] tenant=%s config_version=%s language=%s llm_model=%s turn_detector=MultilingualModel preemptive_generation=%s", tenant.get("slug"), config.get("version"), assistant_language, llm_model, True)
-    debug_logger.log("call", "session_started", room_name=ctx.room.name, tenant_slug=tenant.get("slug"), config_version=config.get("version"), business_timezone=business_timezone, assistant_language=assistant_language, llm_model=llm_model, tts_voice=tts_voice)
+    logger.info("[SESSION_CONFIG] tenant=%s config_version=%s language=%s llm_model=%s tts_speed=%s turn_detector=MultilingualModel preemptive_generation=%s", tenant.get("slug"), config.get("version"), assistant_language, llm_model, tts_speed, True)
+    debug_logger.log("call", "session_started", room_name=ctx.room.name, tenant_slug=tenant.get("slug"), config_version=config.get("version"), business_timezone=business_timezone, assistant_language=assistant_language, llm_model=llm_model, tts_voice=tts_voice, tts_speed=tts_speed)
 
     session = AgentSession(
         stt=deepgram.STT(model="nova-3", language="multi"),
         llm=openai.LLM(model=llm_model),
-        tts=cartesia.TTS(model="sonic-3", voice=tts_voice),
+        tts=cartesia.TTS(model="sonic-3", voice=tts_voice, language=assistant_language, speed=tts_speed),
         turn_detection=MultilingualModel(),
         vad=ctx.proc.userdata["vad"],
         preemptive_generation=True,
