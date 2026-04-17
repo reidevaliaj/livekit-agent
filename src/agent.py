@@ -1,4 +1,4 @@
-import asyncio
+﻿import asyncio
 import inspect
 import json
 import logging
@@ -63,7 +63,7 @@ Rules:
 - Keep responses short and phone-friendly.
 - Never offer prices or promise timelines unless the tenant context explicitly says to.
 - Ask only the next needed question.
-- Collect name, company, and best contact details when relevant.
+- Collect name and email.
 - When collecting email, remember the transcript comes from speech recognition.
 - Always read the email back and ask explicit confirmation.
 - If the email is unclear after two tries, stop forcing it and continue with the call.
