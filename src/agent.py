@@ -151,6 +151,51 @@ def _supports_turn_handling() -> bool:
         return False
 
 
+def _build_debug_runtime_snapshot(
+    *,
+    config: dict[str, Any],
+    tenant: dict[str, Any],
+    business_timezone: str,
+    assistant_language: str,
+    stt_language: str,
+    llm_model: str,
+    tts_voice: str,
+    tts_speed: float,
+    min_endpointing_delay: float,
+    max_endpointing_delay: float,
+    interruption_mode: str,
+    interruption_min_duration: float,
+    false_interruption_timeout: float | None,
+    supports_turn_handling: bool,
+) -> dict[str, Any]:
+    return {
+        "tenant_slug": tenant.get("slug"),
+        "config_version": config.get("version"),
+        "business_name": str(config.get("business_name") or tenant.get("display_name") or ""),
+        "business_timezone": business_timezone,
+        "assistant_language": assistant_language,
+        "stt_language": stt_language,
+        "llm_model": llm_model,
+        "tts_voice": tts_voice,
+        "tts_speed": tts_speed,
+        "turn_detection_model": "MultilingualModel",
+        "supports_turn_handling": supports_turn_handling,
+        "min_endpointing_delay": min_endpointing_delay,
+        "max_endpointing_delay": max_endpointing_delay,
+        "interruption_mode": interruption_mode,
+        "interruption_min_duration": interruption_min_duration,
+        "false_interruption_timeout": false_interruption_timeout,
+        "resume_false_interruption": RESUME_FALSE_INTERRUPTION,
+        "preemptive_generation": True,
+        "meeting_duration_minutes": int(config.get("meeting_duration_minutes") or 30),
+        "booking_horizon_days": int(config.get("booking_horizon_days") or 14),
+        "enabled_tools": dict(config.get("enabled_tools") or {}),
+        "tenant_prompt_chars": len(str(config.get("tenant_prompt") or "")),
+        "prompt_appendix_chars": len(str(config.get("prompt_appendix") or "")),
+        "services_count": len(config.get("services") or []),
+    }
+
+
 def _best_effort_caller_id(room: rtc.Room) -> Optional[str]:
     try:
         for participant in room.remote_participants.values():
@@ -661,6 +706,7 @@ async def my_agent(ctx: JobContext):
     interruption_mode = _normalize_interruption_mode(None)
     interruption_min_duration = _normalize_interruption_min_duration(None)
     false_interruption_timeout = _normalize_false_interruption_timeout(None)
+    supports_turn_handling = _supports_turn_handling()
     call_context_text = _build_call_context_text(session_config)
 
     logger.info(
@@ -679,6 +725,26 @@ async def my_agent(ctx: JobContext):
         True,
     )
     debug_logger.log("call", "session_started", room_name=ctx.room.name, tenant_slug=tenant.get("slug"), config_version=config.get("version"), business_timezone=business_timezone, assistant_language=assistant_language, stt_language=stt_language, llm_model=llm_model, tts_voice=tts_voice, tts_speed=tts_speed, min_endpointing_delay=min_endpointing_delay, max_endpointing_delay=max_endpointing_delay, interruption_mode=interruption_mode, interruption_min_duration=interruption_min_duration, false_interruption_timeout=false_interruption_timeout)
+    debug_logger.log(
+        "config",
+        "runtime_snapshot",
+        snapshot=_build_debug_runtime_snapshot(
+            config=config,
+            tenant=tenant,
+            business_timezone=business_timezone,
+            assistant_language=assistant_language,
+            stt_language=stt_language,
+            llm_model=llm_model,
+            tts_voice=tts_voice,
+            tts_speed=tts_speed,
+            min_endpointing_delay=min_endpointing_delay,
+            max_endpointing_delay=max_endpointing_delay,
+            interruption_mode=interruption_mode,
+            interruption_min_duration=interruption_min_duration,
+            false_interruption_timeout=false_interruption_timeout,
+            supports_turn_handling=supports_turn_handling,
+        ),
+    )
 
     session_kwargs: Dict[str, Any] = {
         "stt": deepgram.STT(model="nova-3", language=stt_language),
@@ -686,7 +752,7 @@ async def my_agent(ctx: JobContext):
         "tts": cartesia.TTS(model="sonic-3", voice=tts_voice, language=assistant_language, speed=tts_speed),
         "vad": ctx.proc.userdata["vad"],
     }
-    if _supports_turn_handling():
+    if supports_turn_handling:
         session_kwargs["turn_handling"] = {
             "turn_detection": MultilingualModel(),
             "endpointing": {
