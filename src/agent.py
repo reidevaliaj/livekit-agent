@@ -77,6 +77,7 @@ FAREWELL_BY_LANGUAGE = {
     "it": "Grazie per aver chiamato {business_name}. Arrivederci.",
     "de": "Vielen Dank fuer Ihren Anruf bei {business_name}. Auf Wiedersehen.",
 }
+SUPPORTED_STT_LANGUAGES = {"en", "it", "de", "multi"}
 
 
 def _normalize_tts_speed(value: Any) -> float:
@@ -85,6 +86,29 @@ def _normalize_tts_speed(value: Any) -> float:
     except (TypeError, ValueError):
         speed = DEFAULT_TTS_SPEED
     return min(1.5, max(0.6, speed))
+
+
+def _normalize_stt_language(value: Any, assistant_language: str) -> str:
+    candidate = str(value or "").strip().lower()
+    if candidate in SUPPORTED_STT_LANGUAGES:
+        return candidate
+    fallback = str(assistant_language or "en").strip().lower()
+    return fallback if fallback in SUPPORTED_STT_LANGUAGES else "en"
+
+
+def _normalize_endpointing_window(min_value: Any, max_value: Any) -> tuple[float, float]:
+    def _coerce(value: Any, default: float) -> float:
+        try:
+            delay = float(value if value not in (None, "") else default)
+        except (TypeError, ValueError):
+            delay = default
+        return min(6.0, max(0.1, delay))
+
+    minimum = _coerce(min_value, 0.3)
+    maximum = _coerce(max_value, 1.2)
+    if maximum < minimum:
+        maximum = minimum
+    return minimum, maximum
 
 
 def _best_effort_caller_id(room: rtc.Room) -> Optional[str]:
@@ -284,7 +308,7 @@ def _lookup_attr(attrs: dict[str, str], *candidates: str) -> str:
 def _fallback_session_config(room_name: str, caller_id: str) -> dict[str, Any]:
     return {
         "tenant": {"id": DEFAULT_TENANT_ID, "slug": DEFAULT_TENANT_ID, "display_name": "Code Studio", "status": "active", "notes": "Legacy fallback session config"},
-        "config": {"version": 1, "business_name": "Code Studio", "assistant_language": "en", "assistant_language_label": "English", "timezone": DEFAULT_BUSINESS_TIMEZONE, "greeting": "Thanks for calling Code Studio. How may we help you today?", "tenant_prompt": "You are the receptionist for Code Studio. Help callers understand the business, answer with the configured services, and collect accurate lead details.", "services": ["Web Design", "WordPress, TYPO3, Shopify", "Headless CMS", "Web applications", "AI integration and agents creation", "SEO"], "faq_notes": "", "prompt_appendix": "", "business_hours": "09:00-17:00", "business_days": "1,2,3,4,5", "meeting_duration_minutes": 30, "booking_horizon_days": 14, "enabled_tools": {"email_summary": True, "meeting_creation": True, "case_creation": True, "calendar_lookup": True, "zoom_meetings": True}, "llm_model": DEFAULT_LLM_MODEL, "tts_voice": DEFAULT_TTS_VOICE, "tts_speed": DEFAULT_TTS_SPEED, "owner_name": "Rey", "owner_email": "info@code-studio.eu", "reply_to_email": "Rej Aliaj <info@code-studio.eu>", "from_email": "Code Studio <noreply@code-studio.eu>", "notification_targets": ["info@code-studio.eu"], "extra_settings": {"meeting_owner_email": "aliajrei@gmail.com"}},
+        "config": {"version": 1, "business_name": "Code Studio", "assistant_language": "en", "assistant_language_label": "English", "stt_language": "en", "timezone": DEFAULT_BUSINESS_TIMEZONE, "greeting": "Thanks for calling Code Studio. How may we help you today?", "tenant_prompt": "You are the receptionist for Code Studio. Help callers understand the business, answer with the configured services, and collect accurate lead details.", "services": ["Web Design", "WordPress, TYPO3, Shopify", "Headless CMS", "Web applications", "AI integration and agents creation", "SEO"], "faq_notes": "", "prompt_appendix": "", "business_hours": "09:00-17:00", "business_days": "1,2,3,4,5", "meeting_duration_minutes": 30, "booking_horizon_days": 14, "enabled_tools": {"email_summary": True, "meeting_creation": True, "case_creation": True, "calendar_lookup": True, "zoom_meetings": True}, "llm_model": DEFAULT_LLM_MODEL, "min_endpointing_delay": 0.3, "max_endpointing_delay": 1.2, "tts_voice": DEFAULT_TTS_VOICE, "tts_speed": DEFAULT_TTS_SPEED, "owner_name": "Rey", "owner_email": "info@code-studio.eu", "reply_to_email": "Rej Aliaj <info@code-studio.eu>", "from_email": "Code Studio <noreply@code-studio.eu>", "notification_targets": ["info@code-studio.eu"], "extra_settings": {"meeting_owner_email": "aliajrei@gmail.com"}},
         "resolved_at": datetime.now(timezone.utc).isoformat(),
         "room_name": room_name,
         "caller_id": caller_id,
@@ -589,17 +613,35 @@ async def my_agent(ctx: JobContext):
     tts_voice = str(config.get("tts_voice") or DEFAULT_TTS_VOICE)
     tts_speed = _normalize_tts_speed(config.get("tts_speed"))
     assistant_language = str(config.get("assistant_language") or "en")
+    stt_language = _normalize_stt_language(config.get("stt_language"), assistant_language)
+    min_endpointing_delay, max_endpointing_delay = _normalize_endpointing_window(
+        config.get("min_endpointing_delay"),
+        config.get("max_endpointing_delay"),
+    )
     call_context_text = _build_call_context_text(session_config)
 
-    logger.info("[SESSION_CONFIG] tenant=%s config_version=%s language=%s llm_model=%s tts_speed=%s turn_detector=MultilingualModel preemptive_generation=%s", tenant.get("slug"), config.get("version"), assistant_language, llm_model, tts_speed, True)
-    debug_logger.log("call", "session_started", room_name=ctx.room.name, tenant_slug=tenant.get("slug"), config_version=config.get("version"), business_timezone=business_timezone, assistant_language=assistant_language, llm_model=llm_model, tts_voice=tts_voice, tts_speed=tts_speed)
+    logger.info(
+        "[SESSION_CONFIG] tenant=%s config_version=%s language=%s stt_language=%s llm_model=%s tts_speed=%s min_endpointing_delay=%.2f max_endpointing_delay=%.2f turn_detector=MultilingualModel preemptive_generation=%s",
+        tenant.get("slug"),
+        config.get("version"),
+        assistant_language,
+        stt_language,
+        llm_model,
+        tts_speed,
+        min_endpointing_delay,
+        max_endpointing_delay,
+        True,
+    )
+    debug_logger.log("call", "session_started", room_name=ctx.room.name, tenant_slug=tenant.get("slug"), config_version=config.get("version"), business_timezone=business_timezone, assistant_language=assistant_language, stt_language=stt_language, llm_model=llm_model, tts_voice=tts_voice, tts_speed=tts_speed, min_endpointing_delay=min_endpointing_delay, max_endpointing_delay=max_endpointing_delay)
 
     session = AgentSession(
-        stt=deepgram.STT(model="nova-3", language="multi"),
+        stt=deepgram.STT(model="nova-3", language=stt_language),
         llm=openai.LLM(model=llm_model),
         tts=cartesia.TTS(model="sonic-3", voice=tts_voice, language=assistant_language, speed=tts_speed),
         turn_detection=MultilingualModel(),
         vad=ctx.proc.userdata["vad"],
+        min_endpointing_delay=min_endpointing_delay,
+        max_endpointing_delay=max_endpointing_delay,
         preemptive_generation=True,
     )
 
