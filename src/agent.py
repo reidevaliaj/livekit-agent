@@ -43,6 +43,10 @@ DEFAULT_TTS_VOICE = (
     or "9626c31c-bec5-4cca-baa8-f8ba9e84c8bc"
 ).strip()
 DEFAULT_TTS_SPEED = float((os.getenv("DEFAULT_TTS_SPEED", "1.0") or "1.0").strip() or "1.0")
+INTERRUPTION_MODE = (os.getenv("INTERRUPTION_MODE", "adaptive") or "adaptive").strip().lower()
+INTERRUPTION_MIN_DURATION = float((os.getenv("INTERRUPTION_MIN_DURATION", "0.5") or "0.5").strip() or "0.5")
+FALSE_INTERRUPTION_TIMEOUT_RAW = (os.getenv("FALSE_INTERRUPTION_TIMEOUT", "2.0") or "2.0").strip()
+RESUME_FALSE_INTERRUPTION = os.getenv("RESUME_FALSE_INTERRUPTION", "true").strip().lower() == "true"
 AGENT_NUM_IDLE_PROCESSES = int(os.getenv("AGENT_NUM_IDLE_PROCESSES", "1").strip() or "1")
 AGENT_LOAD_THRESHOLD = float(os.getenv("AGENT_LOAD_THRESHOLD", "0.95").strip() or "0.95")
 ENABLE_LLM_WARMUP = os.getenv("ENABLE_LLM_WARMUP", "false").strip().lower() == "true"
@@ -78,6 +82,7 @@ FAREWELL_BY_LANGUAGE = {
     "de": "Vielen Dank fuer Ihren Anruf bei {business_name}. Auf Wiedersehen.",
 }
 SUPPORTED_STT_LANGUAGES = {"en", "it", "de", "multi"}
+SUPPORTED_INTERRUPTION_MODES = {"adaptive", "vad"}
 
 
 def _normalize_tts_speed(value: Any) -> float:
@@ -86,6 +91,34 @@ def _normalize_tts_speed(value: Any) -> float:
     except (TypeError, ValueError):
         speed = DEFAULT_TTS_SPEED
     return min(1.5, max(0.6, speed))
+
+
+def _normalize_interruption_mode(value: Any) -> str:
+    candidate = str(value or INTERRUPTION_MODE or "adaptive").strip().lower()
+    return candidate if candidate in SUPPORTED_INTERRUPTION_MODES else "adaptive"
+
+
+def _normalize_interruption_min_duration(value: Any) -> float:
+    try:
+        duration = float(value if value not in (None, "") else INTERRUPTION_MIN_DURATION)
+    except (TypeError, ValueError):
+        duration = INTERRUPTION_MIN_DURATION
+    return min(3.0, max(0.05, duration))
+
+
+def _normalize_false_interruption_timeout(value: Any) -> float | None:
+    if value is None:
+        value = FALSE_INTERRUPTION_TIMEOUT_RAW
+    text = str(value).strip()
+    if not text:
+        return 2.0
+    if text.lower() in {"none", "off", "disabled"}:
+        return None
+    try:
+        timeout = float(text)
+    except (TypeError, ValueError):
+        timeout = 2.0
+    return min(10.0, max(0.1, timeout))
 
 
 def _normalize_stt_language(value: Any, assistant_language: str) -> str:
@@ -109,6 +142,13 @@ def _normalize_endpointing_window(min_value: Any, max_value: Any) -> tuple[float
     if maximum < minimum:
         maximum = minimum
     return minimum, maximum
+
+
+def _supports_turn_handling() -> bool:
+    try:
+        return "turn_handling" in inspect.signature(AgentSession).parameters
+    except Exception:
+        return False
 
 
 def _best_effort_caller_id(room: rtc.Room) -> Optional[str]:
@@ -618,10 +658,13 @@ async def my_agent(ctx: JobContext):
         config.get("min_endpointing_delay"),
         config.get("max_endpointing_delay"),
     )
+    interruption_mode = _normalize_interruption_mode(None)
+    interruption_min_duration = _normalize_interruption_min_duration(None)
+    false_interruption_timeout = _normalize_false_interruption_timeout(None)
     call_context_text = _build_call_context_text(session_config)
 
     logger.info(
-        "[SESSION_CONFIG] tenant=%s config_version=%s language=%s stt_language=%s llm_model=%s tts_speed=%s min_endpointing_delay=%.2f max_endpointing_delay=%.2f turn_detector=MultilingualModel preemptive_generation=%s",
+        "[SESSION_CONFIG] tenant=%s config_version=%s language=%s stt_language=%s llm_model=%s tts_speed=%s min_endpointing_delay=%.2f max_endpointing_delay=%.2f interruption_mode=%s interruption_min_duration=%.2f false_interruption_timeout=%s turn_detector=MultilingualModel preemptive_generation=%s",
         tenant.get("slug"),
         config.get("version"),
         assistant_language,
@@ -630,20 +673,50 @@ async def my_agent(ctx: JobContext):
         tts_speed,
         min_endpointing_delay,
         max_endpointing_delay,
+        interruption_mode,
+        interruption_min_duration,
+        false_interruption_timeout,
         True,
     )
-    debug_logger.log("call", "session_started", room_name=ctx.room.name, tenant_slug=tenant.get("slug"), config_version=config.get("version"), business_timezone=business_timezone, assistant_language=assistant_language, stt_language=stt_language, llm_model=llm_model, tts_voice=tts_voice, tts_speed=tts_speed, min_endpointing_delay=min_endpointing_delay, max_endpointing_delay=max_endpointing_delay)
+    debug_logger.log("call", "session_started", room_name=ctx.room.name, tenant_slug=tenant.get("slug"), config_version=config.get("version"), business_timezone=business_timezone, assistant_language=assistant_language, stt_language=stt_language, llm_model=llm_model, tts_voice=tts_voice, tts_speed=tts_speed, min_endpointing_delay=min_endpointing_delay, max_endpointing_delay=max_endpointing_delay, interruption_mode=interruption_mode, interruption_min_duration=interruption_min_duration, false_interruption_timeout=false_interruption_timeout)
 
-    session = AgentSession(
-        stt=deepgram.STT(model="nova-3", language=stt_language),
-        llm=openai.LLM(model=llm_model),
-        tts=cartesia.TTS(model="sonic-3", voice=tts_voice, language=assistant_language, speed=tts_speed),
-        turn_detection=MultilingualModel(),
-        vad=ctx.proc.userdata["vad"],
-        min_endpointing_delay=min_endpointing_delay,
-        max_endpointing_delay=max_endpointing_delay,
-        preemptive_generation=True,
-    )
+    session_kwargs: Dict[str, Any] = {
+        "stt": deepgram.STT(model="nova-3", language=stt_language),
+        "llm": openai.LLM(model=llm_model),
+        "tts": cartesia.TTS(model="sonic-3", voice=tts_voice, language=assistant_language, speed=tts_speed),
+        "vad": ctx.proc.userdata["vad"],
+    }
+    if _supports_turn_handling():
+        session_kwargs["turn_handling"] = {
+            "turn_detection": MultilingualModel(),
+            "endpointing": {
+                "min_delay": min_endpointing_delay,
+                "max_delay": max_endpointing_delay,
+            },
+            "interruption": {
+                "mode": interruption_mode,
+                "min_duration": interruption_min_duration,
+                "resume_false_interruption": RESUME_FALSE_INTERRUPTION,
+                "false_interruption_timeout": false_interruption_timeout,
+            },
+            "preemptive_generation": {
+                "enabled": True,
+            },
+        }
+    else:
+        if interruption_mode == "adaptive":
+            logger.warning("[SESSION_CONFIG] adaptive interruption requested but current SDK does not support turn_handling; falling back to legacy interruption handling")
+        session_kwargs.update(
+            turn_detection=MultilingualModel(),
+            min_endpointing_delay=min_endpointing_delay,
+            max_endpointing_delay=max_endpointing_delay,
+            min_interruption_duration=interruption_min_duration,
+            false_interruption_timeout=false_interruption_timeout,
+            resume_false_interruption=RESUME_FALSE_INTERRUPTION,
+            preemptive_generation=True,
+        )
+
+    session = AgentSession(**session_kwargs)
 
     await session.start(
         agent=Assistant(session_config=session_config, call_context_text=call_context_text, debug_logger=debug_logger),
