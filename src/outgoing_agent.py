@@ -48,6 +48,7 @@ FALSE_INTERRUPTION_TIMEOUT_RAW = (os.getenv("FALSE_INTERRUPTION_TIMEOUT", "2.0")
 RESUME_FALSE_INTERRUPTION = os.getenv("RESUME_FALSE_INTERRUPTION", "true").strip().lower() == "true"
 AGENT_NUM_IDLE_PROCESSES = int(os.getenv("AGENT_NUM_IDLE_PROCESSES", "1").strip() or "1")
 AGENT_LOAD_THRESHOLD = float(os.getenv("AGENT_LOAD_THRESHOLD", "0.95").strip() or "0.95")
+OUTGOING_AGENT_HTTP_PORT = int((os.getenv("OUTGOING_AGENT_HTTP_PORT", "8082") or "8082").strip() or "8082")
 OUTGOING_AGENT_NAME = (os.getenv("OUTGOING_AGENT_NAME", "outgoing-agent") or "outgoing-agent").strip()
 OUTGOING_AGENT_DEBUG_LOG_PATH = (
     os.getenv("OUTGOING_AGENT_DEBUG_LOG_PATH")
@@ -395,11 +396,20 @@ class OutgoingAssistant(Agent):
 
 
 try:
-    server = AgentServer(num_idle_processes=AGENT_NUM_IDLE_PROCESSES, load_threshold=AGENT_LOAD_THRESHOLD)
-    logger.info("[SERVER] configured num_idle_processes=%s load_threshold=%.2f", AGENT_NUM_IDLE_PROCESSES, AGENT_LOAD_THRESHOLD)
+    server = AgentServer(
+        num_idle_processes=AGENT_NUM_IDLE_PROCESSES,
+        load_threshold=AGENT_LOAD_THRESHOLD,
+        port=OUTGOING_AGENT_HTTP_PORT,
+    )
+    logger.info(
+        "[SERVER] configured num_idle_processes=%s load_threshold=%.2f port=%s",
+        AGENT_NUM_IDLE_PROCESSES,
+        AGENT_LOAD_THRESHOLD,
+        OUTGOING_AGENT_HTTP_PORT,
+    )
 except TypeError:
     logger.warning("[SERVER] AgentServer() does not accept num_idle_processes/load_threshold on this SDK; using defaults")
-    server = AgentServer()
+    server = AgentServer(port=OUTGOING_AGENT_HTTP_PORT)
 
 
 def prewarm(proc: JobProcess):
