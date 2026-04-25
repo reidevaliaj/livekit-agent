@@ -69,9 +69,11 @@ Rules:
 - This is an outbound call initiated by the business.
 - Open with the configured opening phrase once the callee answers.
 - Keep replies warm, concise, and conversational.
+- Treat the outbound configuration as the only source of truth for what to say on this call.
+- Do not reuse inbound receptionist greetings, inbound tenant prompt text, or inbound FAQ copy.
 - If the callee says they are busy, not interested, or wants to stop, be polite and call finish_call.
-- If the callee asks what the business does, answer only using the tenant's configured services and notes.
-- Never invent offers, availability, or commitments not present in the tenant context.
+- If the callee asks what the business does, answer only using the outbound prompt and outbound notes configured for this tenant.
+- Never invent offers, availability, or commitments not present in the outbound prompt or call notes.
 - If the conversation is clearly complete, call finish_call politely.
 """.strip()
 
@@ -347,11 +349,9 @@ class OutgoingAssistant(Agent):
         super().__init__(instructions=self._build_instructions())
 
     def _build_instructions(self) -> str:
-        services = self._config.get("services") or []
-        service_text = "\n".join(f"- {item}" for item in services if str(item).strip())
-        faq_notes = str(self._config.get("faq_notes") or "").strip()
-        tenant_prompt = str(self._config.get("tenant_prompt") or "").strip()
         outgoing_prompt = str(self._outgoing.get("system_prompt") or "").strip()
+        outgoing_notes = str(self._outgoing.get("notes") or "").strip()
+        call_notes = str(self._call.get("notes") or "").strip()
         target_name = str(self._call.get("target_name") or "").strip()
         target_number = str(self._call.get("target_number") or "").strip()
         language_label = LANGUAGE_LABELS.get(self._assistant_language, self._assistant_language)
@@ -363,10 +363,9 @@ class OutgoingAssistant(Agent):
                 f"Business: {self._business_name}",
                 f"Callee name: {target_name or 'unknown'}",
                 f"Callee number: {target_number}",
-                f"Tenant prompt:\n{tenant_prompt or '(none)'}",
                 f"Outgoing prompt:\n{outgoing_prompt or '(none)'}",
-                f"Services:\n{service_text or '(none)'}",
-                f"FAQ / Notes:\n{faq_notes or '(none)'}",
+                f"Outbound notes:\n{outgoing_notes or '(none)'}",
+                f"Call-specific notes:\n{call_notes or '(none)'}",
                 f"Opening phrase (already spoken at call start): {self._outgoing.get('opening_phrase') or ''}",
             ]
         )
@@ -437,11 +436,11 @@ async def outgoing_agent(ctx: JobContext):
     outgoing_call_id = str(call.get("id") or "")
 
     business_timezone = str(config.get("timezone") or DEFAULT_BUSINESS_TIMEZONE)
-    llm_model = str(config.get("llm_model") or DEFAULT_LLM_MODEL)
-    tts_voice = str(config.get("tts_voice") or DEFAULT_TTS_VOICE)
-    tts_speed = _normalize_tts_speed(config.get("tts_speed"))
-    assistant_language = str(config.get("assistant_language") or "en")
-    stt_language = _normalize_stt_language(config.get("stt_language"), assistant_language)
+    llm_model = str(outgoing.get("llm_model") or config.get("llm_model") or DEFAULT_LLM_MODEL)
+    tts_voice = str(outgoing.get("tts_voice") or config.get("tts_voice") or DEFAULT_TTS_VOICE)
+    tts_speed = _normalize_tts_speed(outgoing.get("tts_speed") if outgoing.get("tts_speed") not in (None, "") else config.get("tts_speed"))
+    assistant_language = str(outgoing.get("assistant_language") or config.get("assistant_language") or "en")
+    stt_language = _normalize_stt_language(outgoing.get("stt_language") or config.get("stt_language"), assistant_language)
     min_endpointing_delay, max_endpointing_delay = _normalize_endpointing_window(
         config.get("min_endpointing_delay"),
         config.get("max_endpointing_delay"),
@@ -491,6 +490,8 @@ async def outgoing_agent(ctx: JobContext):
             "interruption_min_duration": interruption_min_duration,
             "false_interruption_timeout": false_interruption_timeout,
             "opening_phrase": outgoing.get("opening_phrase"),
+            "outgoing_prompt": outgoing.get("system_prompt"),
+            "outgoing_notes": outgoing.get("notes"),
             "target_name": call.get("target_name"),
             "target_number": call.get("target_number"),
         },
