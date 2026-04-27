@@ -71,10 +71,10 @@ Rules:
 - Keep replies warm, concise, and conversational.
 - Treat the outbound configuration as the only source of truth for what to say on this call.
 - Do not reuse inbound receptionist greetings, inbound tenant prompt text, or inbound FAQ copy.
-- If the callee says they are busy, not interested, or wants to stop, be polite and call finish_call.
+- If the callee says they are busy, not interested, or wants to stop, be polite and call end_call.
 - If the callee asks what the business does, answer only using the outbound prompt and outbound notes configured for this tenant.
 - Never invent offers, availability, or commitments not present in the outbound prompt or call notes.
-- If the conversation is clearly complete, call finish_call politely.
+- If the conversation is clearly complete, call end_call politely.
 """.strip()
 
 LANGUAGE_LABELS = {
@@ -374,12 +374,11 @@ class OutgoingAssistant(Agent):
         template = FAREWELL_BY_LANGUAGE.get(self._assistant_language, FAREWELL_BY_LANGUAGE["en"])
         return template.format(business_name=self._business_name)
 
-    @function_tool
-    async def finish_call(self, context: RunContext, notes: str = "") -> str:
+    async def _end_call_impl(self, context: RunContext, notes: str = "", source: str = "end_call") -> str:
         if self._call_end_in_progress:
             return "Ending the call now."
         self._call_end_in_progress = True
-        self._debug.log("tool", "finish_call.start", notes=notes)
+        self._debug.log("tool", f"{source}.start", notes=notes)
         try:
             ctx = get_job_context()
             session_obj = getattr(context, "session", None)
@@ -388,10 +387,34 @@ class OutgoingAssistant(Agent):
                     await asyncio.wait_for(session_obj.say(self._farewell_text()), timeout=6.0)
                 except Exception:
                     logger.exception("[OUTGOING_CALL_END] farewell failed")
+            try:
+                await _post_json(
+                    "/outgoing/calls/end",
+                    {
+                        "tenant_id": str(self._tenant.get("id") or ""),
+                        "tenant_slug": str(self._tenant.get("slug") or ""),
+                        "outgoing_call_id": str(self._call.get("id") or ""),
+                        "call_sid": str(self._call.get("telnyx_call_control_id") or ""),
+                        "reason": "assistant_goodbye",
+                        "notes": notes,
+                        "timestamp": int(time.time()),
+                    },
+                )
+                self._debug.log("tool", f"{source}.provider_hangup_requested", notes=notes)
+            except Exception:
+                logger.exception("[OUTGOING_CALL_END] provider hangup request failed")
             await ctx.room.disconnect()
             return "Ending the call now."
         finally:
             self._call_end_in_progress = False
+
+    @function_tool
+    async def end_call(self, context: RunContext, notes: str = "") -> str:
+        return await self._end_call_impl(context, notes=notes, source="end_call")
+
+    @function_tool
+    async def finish_call(self, context: RunContext, notes: str = "") -> str:
+        return await self._end_call_impl(context, notes=notes, source="finish_call")
 
 
 try:
