@@ -394,7 +394,12 @@ class OutgoingAssistant(Agent):
                         "tenant_id": str(self._tenant.get("id") or ""),
                         "tenant_slug": str(self._tenant.get("slug") or ""),
                         "outgoing_call_id": str(self._call.get("id") or ""),
-                        "call_sid": str(self._call.get("telnyx_call_control_id") or ""),
+                        "call_sid": str(
+                            self._call.get("provider_call_id")
+                            or self._call.get("telnyx_call_control_id")
+                            or self._call.get("twilio_call_sid")
+                            or ""
+                        ),
                         "reason": "assistant_goodbye",
                         "notes": notes,
                         "timestamp": int(time.time()),
@@ -455,7 +460,7 @@ async def outgoing_agent(ctx: JobContext):
     call = session_config["call"]
     tenant_id = str(tenant.get("id") or "")
     tenant_slug = str(tenant.get("slug") or "")
-    call_sid = str(call.get("telnyx_call_control_id") or "")
+    call_sid = str(call.get("provider_call_id") or call.get("telnyx_call_control_id") or call.get("twilio_call_sid") or "")
     outgoing_call_id = str(call.get("id") or "")
 
     business_timezone = str(config.get("timezone") or DEFAULT_BUSINESS_TIMEZONE)
@@ -479,6 +484,7 @@ async def outgoing_agent(ctx: JobContext):
         room_name=ctx.room.name,
         tenant_slug=tenant_slug,
         outgoing_call_id=outgoing_call_id,
+        provider=str(call.get("provider") or "unknown"),
         business_timezone=business_timezone,
         assistant_language=assistant_language,
         stt_language=stt_language,
@@ -497,6 +503,7 @@ async def outgoing_agent(ctx: JobContext):
         snapshot={
             "tenant_slug": tenant_slug,
             "outgoing_call_id": outgoing_call_id,
+            "provider": str(call.get("provider") or "unknown"),
             "config_version": config.get("version"),
             "business_name": str(config.get("business_name") or tenant.get("display_name") or ""),
             "business_timezone": business_timezone,
