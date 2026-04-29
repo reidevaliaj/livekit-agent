@@ -450,7 +450,11 @@ server.setup_fnc = prewarm
 async def outgoing_agent(ctx: JobContext):
     ctx.log_context_fields = {"room": ctx.room.name}
     logger.info("[OUTGOING_CALL_START] room=%s", ctx.room.name)
-    debug_logger = CallDebugLogger(path=Path(OUTGOING_AGENT_DEBUG_LOG_PATH))
+    debug_logger = CallDebugLogger(
+        path=Path(OUTGOING_AGENT_DEBUG_LOG_PATH),
+        reset_on_init=False,
+        cleanup_on_close=False,
+    )
 
     await ctx.connect()
     session_config = await _fetch_outgoing_session_config(ctx)
@@ -631,7 +635,7 @@ async def outgoing_agent(ctx: JobContext):
             logger.exception("[OUTGOING_CALL_END] transcript send failed room=%s reason=%s", ctx.room.name, reason)
         finally:
             debug_logger.log("call", "shutdown_finished", room_name=ctx.room.name, reason=reason)
-            debug_logger.close(cleanup=True)
+            debug_logger.close(cleanup=False)
 
     ctx.add_shutdown_callback(_send_transcript_on_shutdown)
 

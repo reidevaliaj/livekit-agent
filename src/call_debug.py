@@ -14,10 +14,18 @@ DEFAULT_DEBUG_LOG_PATH = REPO_ROOT / "runtime" / "active_call_debug.log"
 
 
 class CallDebugLogger:
-    def __init__(self, path: Path | None = None) -> None:
+    def __init__(
+        self,
+        path: Path | None = None,
+        *,
+        reset_on_init: bool = True,
+        cleanup_on_close: bool = True,
+    ) -> None:
         self.path = Path(path or DEFAULT_DEBUG_LOG_PATH)
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.path.write_text("", encoding="utf-8")
+        self._cleanup_on_close = cleanup_on_close
+        if reset_on_init:
+            self.path.write_text("", encoding="utf-8")
 
         self._queue: queue.SimpleQueue[str | None] = queue.SimpleQueue()
         self._closed = False
@@ -39,7 +47,7 @@ class CallDebugLogger:
             parts.append(f"{key}={self._serialize(value)}")
         self._queue.put(" | ".join(parts))
 
-    def close(self, cleanup: bool = True) -> None:
+    def close(self, cleanup: bool | None = None) -> None:
         if self._closed:
             return
 
@@ -47,7 +55,8 @@ class CallDebugLogger:
         self._queue.put(None)
         self._writer.join(timeout=1.5)
 
-        if cleanup:
+        should_cleanup = self._cleanup_on_close if cleanup is None else cleanup
+        if should_cleanup:
             self.path.write_text("", encoding="utf-8")
 
     def _writer_loop(self) -> None:
