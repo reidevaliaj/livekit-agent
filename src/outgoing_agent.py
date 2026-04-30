@@ -218,6 +218,10 @@ def _normalize_attr_key(value: str) -> str:
     return value.lower().replace("-", "_").replace(".", "_")
 
 
+def _normalize_prompt_tool_name(value: Any) -> str:
+    return " ".join(str(value or "").strip().lower().split())
+
+
 def _participant_context(participant: Optional[rtc.RemoteParticipant]) -> dict[str, str]:
     if participant is None:
         return {}
@@ -612,6 +616,15 @@ class OutgoingAssistant(Agent):
         self._assistant_language = str(self._config.get("assistant_language") or "en")
         self._business_name = str(self._config.get("business_name") or self._tenant.get("display_name") or "the business")
         self._call_end_in_progress = False
+        self._prompt_tools = [
+            item
+            for item in list(self._outgoing.get("prompt_tools") or [])
+            if isinstance(item, dict) and str(item.get("name") or "").strip()
+        ]
+        self._prompt_tools_by_name = {
+            _normalize_prompt_tool_name(item.get("name")): item
+            for item in self._prompt_tools
+        }
         super().__init__(instructions=self._build_instructions())
 
     def _build_instructions(self) -> str:
@@ -621,6 +634,12 @@ class OutgoingAssistant(Agent):
         target_name = str(self._call.get("target_name") or "").strip()
         target_number = str(self._call.get("target_number") or "").strip()
         language_label = LANGUAGE_LABELS.get(self._assistant_language, self._assistant_language)
+        prompt_tool_lines = []
+        for item in self._prompt_tools:
+            tool_name = str(item.get("name") or "").strip()
+            if tool_name:
+                prompt_tool_lines.append(f"- {tool_name}")
+        prompt_tool_block = "\n".join(prompt_tool_lines) if prompt_tool_lines else "(none configured)"
         return "\n\n".join(
             [
                 PLATFORM_RULES,
@@ -631,6 +650,8 @@ class OutgoingAssistant(Agent):
                 f"Callee number: {target_number}",
                 f"Outgoing prompt:\n{outgoing_prompt or '(none)'}",
                 f"Outbound notes:\n{outgoing_notes or '(none)'}",
+                "Available on-demand knowledge tools (load them only when needed with lookup_prompt_tool):\n"
+                f"{prompt_tool_block}",
                 f"Call-specific notes:\n{call_notes or '(none)'}",
                 f"Opening phrase (already spoken at call start): {self._outgoing.get('opening_phrase') or ''}",
             ]
@@ -686,6 +707,26 @@ class OutgoingAssistant(Agent):
     @function_tool
     async def finish_call(self, context: RunContext, notes: str = "") -> str:
         return await self._end_call_impl(context, notes=notes, source="finish_call")
+
+    @function_tool
+    async def lookup_prompt_tool(self, tool_name: str, user_question: str = "") -> str:
+        normalized = _normalize_prompt_tool_name(tool_name)
+        tool = self._prompt_tools_by_name.get(normalized)
+        if tool is None:
+            available = ", ".join(sorted(str(item.get("name") or "").strip() for item in self._prompt_tools if str(item.get("name") or "").strip()))
+            return (
+                f"No outgoing knowledge tool named '{tool_name}' is configured. "
+                f"Available tools: {available or 'none'}."
+            )
+        resolved_name = str(tool.get("name") or tool_name).strip()
+        self._debug.log("tool", "lookup_prompt_tool.start", tool_name=resolved_name, user_question=user_question)
+        content = str(tool.get("content") or "").strip()
+        return (
+            f"Outgoing knowledge tool: {resolved_name}\n"
+            f"User question: {user_question or '(none provided)'}\n\n"
+            "Use the following content as the source of truth for this topic only:\n"
+            f"{content}"
+        )
 
 
 try:
@@ -830,6 +871,8 @@ async def outgoing_agent(ctx: JobContext):
             "opening_phrase": outgoing.get("opening_phrase"),
             "outgoing_prompt": outgoing.get("system_prompt"),
             "outgoing_notes": outgoing.get("notes"),
+            "prompt_tool_count": len(list(outgoing.get("prompt_tools") or [])),
+            "prompt_tool_names": [str(item.get("name") or "") for item in list(outgoing.get("prompt_tools") or []) if isinstance(item, dict)],
             "target_name": call.get("target_name"),
             "target_number": call.get("target_number"),
         },
