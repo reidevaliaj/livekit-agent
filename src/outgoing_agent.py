@@ -10,6 +10,7 @@ from typing import Any, Dict, Optional
 
 import httpx
 from dotenv import load_dotenv
+from livekit import api as livekit_api
 from livekit import rtc
 from livekit.agents import (
     Agent,
@@ -54,6 +55,7 @@ OUTGOING_LLM_WARMUP_MODEL = (os.getenv("OUTGOING_LLM_WARMUP_MODEL", "gpt-4.1-nan
 OUTGOING_INTERRUPTION_MIN_WORDS = int((os.getenv("OUTGOING_INTERRUPTION_MIN_WORDS", "3") or "3").strip() or "3")
 OUTGOING_AGENT_HTTP_PORT = int((os.getenv("OUTGOING_AGENT_HTTP_PORT", "8082") or "8082").strip() or "8082")
 OUTGOING_AGENT_NAME = (os.getenv("OUTGOING_AGENT_NAME", "outgoing-agent") or "outgoing-agent").strip()
+OUTGOING_REMOTE_PARTICIPANT_TIMEOUT_SEC = float((os.getenv("OUTGOING_REMOTE_PARTICIPANT_TIMEOUT_SEC", "45") or "45").strip() or "45")
 OUTGOING_AGENT_DEBUG_LOG_PATH = (
     os.getenv("OUTGOING_AGENT_DEBUG_LOG_PATH")
     or str(Path(__file__).resolve().parent.parent / "runtime" / "outgoing_call_debug.log")
@@ -95,6 +97,7 @@ FAREWELL_BY_LANGUAGE = {
 
 SUPPORTED_STT_LANGUAGES = {"en", "it", "de", "multi"}
 SUPPORTED_INTERRUPTION_MODES = {"adaptive", "vad"}
+LIVEKIT_FIRST_MODE = "livekit_first"
 
 
 def _normalize_tts_speed(value: Any) -> float:
@@ -270,6 +273,46 @@ async def _wait_for_remote_participant(room: rtc.Room, timeout_sec: float = 4.0)
     return None
 
 
+async def _wait_for_participant_identity(
+    room: rtc.Room,
+    *,
+    identity: str,
+    timeout_sec: float = 8.0,
+) -> Optional[rtc.RemoteParticipant]:
+    identity = str(identity or "").strip()
+    if not identity:
+        return None
+    deadline = time.monotonic() + timeout_sec
+    while time.monotonic() < deadline:
+        try:
+            participant = room.remote_participants.get(identity)
+            if participant is not None:
+                return participant
+            for remote_participant in room.remote_participants.values():
+                if str(remote_participant.identity or "").strip() == identity:
+                    return remote_participant
+        except Exception:
+            pass
+        await asyncio.sleep(0.1)
+    return None
+
+
+def _job_metadata_payload(ctx: JobContext) -> dict[str, Any]:
+    raw = str(getattr(getattr(ctx, "job", None), "metadata", "") or "").strip()
+    if not raw:
+        return {}
+    try:
+        parsed = json.loads(raw)
+    except Exception:
+        logger.warning("[OUTGOING_CALL_START] invalid job metadata room=%s", ctx.room.name)
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def _is_livekit_first_dispatch(metadata: dict[str, Any]) -> bool:
+    return str(metadata.get("mode") or "").strip().lower() == LIVEKIT_FIRST_MODE
+
+
 async def _warmup_llm_once(*, debug_logger: CallDebugLogger | None = None, trigger: str = "") -> None:
     if not OUTGOING_ENABLE_LLM_WARMUP:
         return
@@ -344,6 +387,10 @@ async def _post_json_and_read(path: str, payload: Dict[str, Any]) -> Dict[str, A
         return response.json()
 
 
+async def _post_livekit_status(payload: Dict[str, Any]) -> None:
+    await _post_json("/outgoing/calls/livekit-status", payload)
+
+
 def _build_transcript_payload(
     session: AgentSession,
     room: rtc.Room,
@@ -384,20 +431,174 @@ def _build_transcript_payload(
     }
 
 
-async def _fetch_outgoing_session_config(ctx: JobContext) -> dict[str, Any]:
-    participant = await _wait_for_remote_participant(ctx.room)
+async def _fetch_outgoing_session_config(ctx: JobContext, dispatch_metadata: Optional[dict[str, Any]] = None) -> dict[str, Any]:
+    participant = None
+    if not _is_livekit_first_dispatch(dispatch_metadata or {}):
+        participant = await _wait_for_remote_participant(ctx.room)
     attrs = _participant_context(participant)
     payload = {
-        "tenant_id": _lookup_attr(attrs, "tenant_id", "x_tenant_id", "x-tenant-id"),
-        "tenant_slug": _lookup_attr(attrs, "tenant_slug", "x_tenant_slug", "x-tenant-slug"),
-        "outgoing_call_id": _lookup_attr(attrs, "outgoing_call_id", "x_outgoing_call_id", "x-outgoing-call-id"),
+        "tenant_id": _lookup_attr(attrs, "tenant_id", "x_tenant_id", "x-tenant-id") or str((dispatch_metadata or {}).get("tenant_id") or ""),
+        "tenant_slug": _lookup_attr(attrs, "tenant_slug", "x_tenant_slug", "x-tenant-slug") or str((dispatch_metadata or {}).get("tenant_slug") or ""),
+        "outgoing_call_id": _lookup_attr(attrs, "outgoing_call_id", "x_outgoing_call_id", "x-outgoing-call-id") or str((dispatch_metadata or {}).get("outgoing_call_id") or ""),
         "room_name": ctx.room.name,
-        "call_sid": _lookup_attr(attrs, "parent_call_sid", "x_parent_call_sid", "x-parent-call-sid"),
+        "call_sid": _lookup_attr(attrs, "parent_call_sid", "x_parent_call_sid", "x-parent-call-sid") or str((dispatch_metadata or {}).get("call_sid") or ""),
     }
     response = await _post_json_and_read("/agent/outgoing-session-config", payload)
     if not response.get("ok"):
         raise RuntimeError("Outgoing session config fetch failed")
     return response
+
+
+async def _dial_livekit_first_participant(
+    ctx: JobContext,
+    *,
+    dispatch_metadata: dict[str, Any],
+    debug_logger: CallDebugLogger,
+) -> Optional[rtc.RemoteParticipant]:
+    phone_number = str(dispatch_metadata.get("phone_number") or "").strip()
+    trunk_id = str(dispatch_metadata.get("sip_trunk_id") or "").strip()
+    participant_identity = str(dispatch_metadata.get("participant_identity") or "").strip()
+    participant_name = str(dispatch_metadata.get("participant_name") or phone_number or "Callee").strip() or "Callee"
+    from_number = str(dispatch_metadata.get("from_number") or "").strip()
+    caller_display_name = str(dispatch_metadata.get("caller_display_name") or "").strip()
+    tenant_id = str(dispatch_metadata.get("tenant_id") or "")
+    tenant_slug = str(dispatch_metadata.get("tenant_slug") or "")
+    outgoing_call_id = str(dispatch_metadata.get("outgoing_call_id") or "")
+
+    if not (phone_number and trunk_id and participant_identity and outgoing_call_id):
+        raise RuntimeError("Missing LiveKit-first outbound dial metadata")
+
+    participant_attrs = {
+        "tenant_id": tenant_id,
+        "tenant_slug": tenant_slug,
+        "outgoing_call_id": outgoing_call_id,
+        "call_direction": "outgoing",
+        "call_provider": str(dispatch_metadata.get("provider") or "telnyx"),
+    }
+    request = livekit_api.CreateSIPParticipantRequest(
+        room_name=ctx.room.name,
+        sip_trunk_id=trunk_id,
+        sip_call_to=phone_number,
+        sip_number=from_number or None,
+        participant_identity=participant_identity,
+        participant_name=participant_name,
+        participant_metadata=json.dumps(participant_attrs),
+        participant_attributes=participant_attrs,
+        play_dialtone=False,
+        krisp_enabled=True,
+        wait_until_answered=True,
+        display_name=caller_display_name or None,
+    )
+
+    debug_logger.log(
+        "call",
+        "livekit_outbound_dial_started",
+        room_name=ctx.room.name,
+        trunk_id=trunk_id,
+        target_number=phone_number,
+        from_number=from_number,
+        participant_identity=participant_identity,
+    )
+    try:
+        participant_info = await ctx.api.sip.create_sip_participant(request)
+        sip_call_id = str(getattr(participant_info, "sip_call_id", "") or "")
+        debug_logger.log(
+            "call",
+            "livekit_outbound_dial_answered",
+            room_name=ctx.room.name,
+            participant_identity=participant_identity,
+            sip_call_id=sip_call_id,
+        )
+        await _post_livekit_status(
+            {
+                "tenant_id": tenant_id,
+                "tenant_slug": tenant_slug,
+                "outgoing_call_id": outgoing_call_id,
+                "room_name": ctx.room.name,
+                "status": "bridged",
+                "provider_call_sid": sip_call_id,
+                "participant_identity": participant_identity,
+                "timestamp": int(time.time()),
+            }
+        )
+    except Exception as exc:
+        metadata = getattr(exc, "metadata", {}) or {}
+        sip_status_code = str(metadata.get("sip_status_code") or "")
+        sip_status = str(metadata.get("sip_status") or "")
+        debug_logger.log(
+            "call",
+            "livekit_outbound_dial_failed",
+            room_name=ctx.room.name,
+            participant_identity=participant_identity,
+            error=str(exc),
+            sip_status_code=sip_status_code,
+            sip_status=sip_status,
+        )
+        try:
+            await _post_livekit_status(
+                {
+                    "tenant_id": tenant_id,
+                    "tenant_slug": tenant_slug,
+                    "outgoing_call_id": outgoing_call_id,
+                    "room_name": ctx.room.name,
+                    "status": "failed",
+                    "participant_identity": participant_identity,
+                    "sip_status_code": sip_status_code,
+                    "sip_status": sip_status,
+                    "error": str(exc),
+                    "timestamp": int(time.time()),
+                }
+            )
+        except Exception:
+            logger.exception("[OUTGOING_CALL_START] failed to post LiveKit failure status room=%s", ctx.room.name)
+        return None
+
+    participant = await _wait_for_participant_identity(
+        ctx.room,
+        identity=participant_identity,
+        timeout_sec=8.0,
+    )
+    if participant is None:
+        try:
+            participant = await asyncio.wait_for(
+                ctx.wait_for_participant(identity=participant_identity),
+                timeout=8.0,
+            )
+        except Exception:
+            participant = None
+    if participant is not None:
+        debug_logger.log(
+            "call",
+            "livekit_remote_participant_ready",
+            room_name=ctx.room.name,
+            participant_identity=participant_identity,
+        )
+        return participant
+
+    error_message = "LiveKit outbound call answered but the SIP participant did not join the room in time"
+    debug_logger.log(
+        "call",
+        "livekit_remote_participant_timeout",
+        room_name=ctx.room.name,
+        participant_identity=participant_identity,
+        error=error_message,
+    )
+    try:
+        await _post_livekit_status(
+            {
+                "tenant_id": tenant_id,
+                "tenant_slug": tenant_slug,
+                "outgoing_call_id": outgoing_call_id,
+                "room_name": ctx.room.name,
+                "status": "failed",
+                "participant_identity": participant_identity,
+                "error": error_message,
+                "timestamp": int(time.time()),
+            }
+        )
+    except Exception:
+        logger.exception("[OUTGOING_CALL_START] failed to post LiveKit timeout status room=%s", ctx.room.name)
+    return None
 
 
 class OutgoingAssistant(Agent):
@@ -525,8 +726,19 @@ async def outgoing_agent(ctx: JobContext):
     debug_logger.log("call", "room_connect_started", room_name=ctx.room.name)
     await ctx.connect()
     debug_logger.log("call", "room_connected", room_name=ctx.room.name)
+    dispatch_metadata = _job_metadata_payload(ctx)
+    if _is_livekit_first_dispatch(dispatch_metadata):
+        debug_logger.log(
+            "call",
+            "livekit_dispatch_loaded",
+            room_name=ctx.room.name,
+            provider=str(dispatch_metadata.get("provider") or "telnyx"),
+            outgoing_call_id=str(dispatch_metadata.get("outgoing_call_id") or ""),
+            target_number=str(dispatch_metadata.get("phone_number") or ""),
+            participant_identity=str(dispatch_metadata.get("participant_identity") or ""),
+        )
     debug_logger.log("call", "session_config_fetch_started", room_name=ctx.room.name)
-    session_config = await _fetch_outgoing_session_config(ctx)
+    session_config = await _fetch_outgoing_session_config(ctx, dispatch_metadata)
     tenant = session_config["tenant"]
     config = session_config["config"]
     outgoing = session_config["outgoing"]
@@ -543,6 +755,16 @@ async def outgoing_agent(ctx: JobContext):
         outgoing_call_id=outgoing_call_id,
         provider=str(call.get("provider") or "unknown"),
     )
+    if _is_livekit_first_dispatch(dispatch_metadata):
+        participant = await _dial_livekit_first_participant(
+            ctx,
+            dispatch_metadata=dispatch_metadata,
+            debug_logger=debug_logger,
+        )
+        if participant is None:
+            debug_logger.close(cleanup=False)
+            ctx.shutdown()
+            return
 
     business_timezone = str(config.get("timezone") or DEFAULT_BUSINESS_TIMEZONE)
     llm_model = str(outgoing.get("llm_model") or config.get("llm_model") or DEFAULT_LLM_MODEL)
