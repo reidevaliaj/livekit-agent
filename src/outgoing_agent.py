@@ -48,6 +48,10 @@ FALSE_INTERRUPTION_TIMEOUT_RAW = (os.getenv("FALSE_INTERRUPTION_TIMEOUT", "2.0")
 RESUME_FALSE_INTERRUPTION = os.getenv("RESUME_FALSE_INTERRUPTION", "true").strip().lower() == "true"
 AGENT_NUM_IDLE_PROCESSES = int(os.getenv("AGENT_NUM_IDLE_PROCESSES", "1").strip() or "1")
 AGENT_LOAD_THRESHOLD = float(os.getenv("AGENT_LOAD_THRESHOLD", "0.95").strip() or "0.95")
+OUTGOING_ENABLE_LLM_WARMUP = os.getenv("OUTGOING_ENABLE_LLM_WARMUP", "true").strip().lower() == "true"
+OUTGOING_LLM_WARMUP_TIMEOUT_SEC = float((os.getenv("OUTGOING_LLM_WARMUP_TIMEOUT_SEC", "3.5") or "3.5").strip() or "3.5")
+OUTGOING_LLM_WARMUP_MODEL = (os.getenv("OUTGOING_LLM_WARMUP_MODEL", "gpt-4.1-nano").strip() or "gpt-4.1-nano")
+OUTGOING_INTERRUPTION_MIN_WORDS = int((os.getenv("OUTGOING_INTERRUPTION_MIN_WORDS", "3") or "3").strip() or "3")
 OUTGOING_AGENT_HTTP_PORT = int((os.getenv("OUTGOING_AGENT_HTTP_PORT", "8082") or "8082").strip() or "8082")
 OUTGOING_AGENT_NAME = (os.getenv("OUTGOING_AGENT_NAME", "outgoing-agent") or "outgoing-agent").strip()
 OUTGOING_AGENT_DEBUG_LOG_PATH = (
@@ -127,6 +131,14 @@ def _normalize_false_interruption_timeout(value: Any) -> float | None:
     except (TypeError, ValueError):
         timeout = 2.0
     return min(10.0, max(0.1, timeout))
+
+
+def _normalize_interruption_min_words(value: Any) -> int:
+    try:
+        word_count = int(value if value not in (None, "") else OUTGOING_INTERRUPTION_MIN_WORDS)
+    except (TypeError, ValueError):
+        word_count = OUTGOING_INTERRUPTION_MIN_WORDS
+    return min(12, max(0, word_count))
 
 
 def _normalize_stt_language(value: Any, assistant_language: str) -> str:
@@ -256,6 +268,59 @@ async def _wait_for_remote_participant(room: rtc.Room, timeout_sec: float = 4.0)
             pass
         await asyncio.sleep(0.1)
     return None
+
+
+async def _warmup_llm_once(*, debug_logger: CallDebugLogger | None = None, trigger: str = "") -> None:
+    if not OUTGOING_ENABLE_LLM_WARMUP:
+        return
+    api_key = (os.getenv("OPENAI_API_KEY") or "").strip()
+    if not api_key:
+        logger.warning("[OUTGOING_WARMUP] skipped: OPENAI_API_KEY not set")
+        if debug_logger is not None:
+            debug_logger.log("warmup", "skipped", reason="OPENAI_API_KEY missing", trigger=trigger)
+        return
+
+    payload = {
+        "model": OUTGOING_LLM_WARMUP_MODEL,
+        "messages": [{"role": "system", "content": "Respond with exactly: ok"}],
+        "max_completion_tokens": 1,
+        "temperature": 0,
+    }
+    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+    timeout = httpx.Timeout(OUTGOING_LLM_WARMUP_TIMEOUT_SEC, connect=2.0)
+    started = time.monotonic()
+    if debug_logger is not None:
+        debug_logger.log("warmup", "started", model=OUTGOING_LLM_WARMUP_MODEL, trigger=trigger)
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            response = await client.post("https://api.openai.com/v1/chat/completions", json=payload, headers=headers)
+            response.raise_for_status()
+        elapsed = time.monotonic() - started
+        logger.info("[OUTGOING_WARMUP] done model=%s elapsed=%.3fs trigger=%s", OUTGOING_LLM_WARMUP_MODEL, elapsed, trigger)
+        if debug_logger is not None:
+            debug_logger.log(
+                "warmup",
+                "completed",
+                model=OUTGOING_LLM_WARMUP_MODEL,
+                trigger=trigger,
+                elapsed_sec=round(elapsed, 3),
+            )
+    except Exception as exc:
+        logger.exception(
+            "[OUTGOING_WARMUP] failed model=%s timeout=%.2fs trigger=%s",
+            OUTGOING_LLM_WARMUP_MODEL,
+            OUTGOING_LLM_WARMUP_TIMEOUT_SEC,
+            trigger,
+        )
+        if debug_logger is not None:
+            debug_logger.log(
+                "warmup",
+                "failed",
+                model=OUTGOING_LLM_WARMUP_MODEL,
+                trigger=trigger,
+                timeout_sec=OUTGOING_LLM_WARMUP_TIMEOUT_SEC,
+                error=str(exc),
+            )
 
 
 async def _post_json(path: str, payload: Dict[str, Any]) -> None:
@@ -455,8 +520,12 @@ async def outgoing_agent(ctx: JobContext):
         reset_on_init=False,
         cleanup_on_close=False,
     )
+    debug_logger.log("call", "job_started", room_name=ctx.room.name)
 
+    debug_logger.log("call", "room_connect_started", room_name=ctx.room.name)
     await ctx.connect()
+    debug_logger.log("call", "room_connected", room_name=ctx.room.name)
+    debug_logger.log("call", "session_config_fetch_started", room_name=ctx.room.name)
     session_config = await _fetch_outgoing_session_config(ctx)
     tenant = session_config["tenant"]
     config = session_config["config"]
@@ -466,6 +535,14 @@ async def outgoing_agent(ctx: JobContext):
     tenant_slug = str(tenant.get("slug") or "")
     call_sid = str(call.get("provider_call_id") or call.get("telnyx_call_control_id") or call.get("twilio_call_sid") or "")
     outgoing_call_id = str(call.get("id") or "")
+    debug_logger.log(
+        "call",
+        "session_config_fetched",
+        room_name=ctx.room.name,
+        tenant_slug=tenant_slug,
+        outgoing_call_id=outgoing_call_id,
+        provider=str(call.get("provider") or "unknown"),
+    )
 
     business_timezone = str(config.get("timezone") or DEFAULT_BUSINESS_TIMEZONE)
     llm_model = str(outgoing.get("llm_model") or config.get("llm_model") or DEFAULT_LLM_MODEL)
@@ -479,6 +556,7 @@ async def outgoing_agent(ctx: JobContext):
     )
     interruption_mode = _normalize_interruption_mode(None)
     interruption_min_duration = _normalize_interruption_min_duration(None)
+    interruption_min_words = _normalize_interruption_min_words(None)
     false_interruption_timeout = _normalize_false_interruption_timeout(None)
     supports_turn_handling = _supports_turn_handling()
 
@@ -499,6 +577,7 @@ async def outgoing_agent(ctx: JobContext):
         max_endpointing_delay=max_endpointing_delay,
         interruption_mode=interruption_mode,
         interruption_min_duration=interruption_min_duration,
+        interruption_min_words=interruption_min_words,
         false_interruption_timeout=false_interruption_timeout,
     )
     debug_logger.log(
@@ -522,7 +601,10 @@ async def outgoing_agent(ctx: JobContext):
             "max_endpointing_delay": max_endpointing_delay,
             "interruption_mode": interruption_mode,
             "interruption_min_duration": interruption_min_duration,
+            "interruption_min_words": interruption_min_words,
             "false_interruption_timeout": false_interruption_timeout,
+            "outgoing_warmup_enabled": OUTGOING_ENABLE_LLM_WARMUP,
+            "outgoing_warmup_model": OUTGOING_LLM_WARMUP_MODEL,
             "opening_phrase": outgoing.get("opening_phrase"),
             "outgoing_prompt": outgoing.get("system_prompt"),
             "outgoing_notes": outgoing.get("notes"),
@@ -544,6 +626,7 @@ async def outgoing_agent(ctx: JobContext):
             "interruption": {
                 "mode": interruption_mode,
                 "min_duration": interruption_min_duration,
+                "min_words": interruption_min_words,
                 "resume_false_interruption": RESUME_FALSE_INTERRUPTION,
                 "false_interruption_timeout": false_interruption_timeout,
             },
@@ -561,6 +644,7 @@ async def outgoing_agent(ctx: JobContext):
         )
 
     session = AgentSession(**session_kwargs)
+    debug_logger.log("call", "agent_session_starting", room_name=ctx.room.name)
     await session.start(
         agent=OutgoingAssistant(session_config=session_config, debug_logger=debug_logger),
         room=ctx.room,
@@ -574,12 +658,25 @@ async def outgoing_agent(ctx: JobContext):
             ),
         ),
     )
+    debug_logger.log("call", "agent_session_ready", room_name=ctx.room.name)
+
+    warmup_started = False
+
+    def _maybe_schedule_warmup(trigger: str) -> None:
+        nonlocal warmup_started
+        if warmup_started or not OUTGOING_ENABLE_LLM_WARMUP:
+            return
+        warmup_started = True
+        debug_logger.log("warmup", "scheduled", trigger=trigger)
+        asyncio.create_task(_warmup_llm_once(debug_logger=debug_logger, trigger=trigger))
 
     @session.on("user_state_changed")
     def _on_user_state_changed(ev: Any) -> None:
         old_state = str(getattr(ev, "old_state", ""))
         new_state = str(getattr(ev, "new_state", ""))
         debug_logger.log("turn", "user_state_changed", old_state=old_state, new_state=new_state)
+        if new_state == "speaking":
+            _maybe_schedule_warmup("user_state_changed")
 
     @session.on("agent_state_changed")
     def _on_agent_state_changed(ev: Any) -> None:
@@ -589,6 +686,7 @@ async def outgoing_agent(ctx: JobContext):
     def _on_user_input_transcribed(ev: Any) -> None:
         text = _event_text_payload(ev)
         if text:
+            _maybe_schedule_warmup("user_input_transcribed")
             debug_logger.log("transcript", "USER_FINAL" if bool(getattr(ev, "is_final", False)) else "USER_PARTIAL", text=text)
 
     @session.on("conversation_item_added")
@@ -641,6 +739,7 @@ async def outgoing_agent(ctx: JobContext):
 
     opening_phrase = str(outgoing.get("opening_phrase") or "").strip()
     if opening_phrase:
+        debug_logger.log("call", "opening_phrase_requested", text=opening_phrase)
         await session.say(opening_phrase)
 
 
