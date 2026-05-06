@@ -819,7 +819,7 @@ async def outgoing_agent(ctx: JobContext):
     )
     interruption_mode = _normalize_interruption_mode(None)
     interruption_min_duration = _normalize_interruption_min_duration(None)
-    interruption_min_words = _normalize_interruption_min_words(None)
+    interruption_min_words = _normalize_interruption_min_words(outgoing.get("interruption_min_words"))
     false_interruption_timeout = _normalize_false_interruption_timeout(None)
     supports_turn_handling = _supports_turn_handling()
 

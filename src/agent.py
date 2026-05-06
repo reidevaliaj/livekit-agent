@@ -47,6 +47,7 @@ INTERRUPTION_MODE = (os.getenv("INTERRUPTION_MODE", "adaptive") or "adaptive").s
 INTERRUPTION_MIN_DURATION = float((os.getenv("INTERRUPTION_MIN_DURATION", "0.5") or "0.5").strip() or "0.5")
 FALSE_INTERRUPTION_TIMEOUT_RAW = (os.getenv("FALSE_INTERRUPTION_TIMEOUT", "2.0") or "2.0").strip()
 RESUME_FALSE_INTERRUPTION = os.getenv("RESUME_FALSE_INTERRUPTION", "true").strip().lower() == "true"
+INTERRUPTION_MIN_WORDS = int((os.getenv("INTERRUPTION_MIN_WORDS", "3") or "3").strip() or "3")
 AGENT_NUM_IDLE_PROCESSES = int(os.getenv("AGENT_NUM_IDLE_PROCESSES", "1").strip() or "1")
 AGENT_LOAD_THRESHOLD = float(os.getenv("AGENT_LOAD_THRESHOLD", "0.95").strip() or "0.95")
 ENABLE_LLM_WARMUP = os.getenv("ENABLE_LLM_WARMUP", "false").strip().lower() == "true"
@@ -121,6 +122,14 @@ def _normalize_false_interruption_timeout(value: Any) -> float | None:
     return min(10.0, max(0.1, timeout))
 
 
+def _normalize_interruption_min_words(value: Any) -> int:
+    try:
+        word_count = int(value if value not in (None, "") else INTERRUPTION_MIN_WORDS)
+    except (TypeError, ValueError):
+        word_count = INTERRUPTION_MIN_WORDS
+    return min(12, max(0, word_count))
+
+
 def _normalize_stt_language(value: Any, assistant_language: str) -> str:
     candidate = str(value or "").strip().lower()
     if candidate in SUPPORTED_STT_LANGUAGES:
@@ -165,6 +174,7 @@ def _build_debug_runtime_snapshot(
     max_endpointing_delay: float,
     interruption_mode: str,
     interruption_min_duration: float,
+    interruption_min_words: int,
     false_interruption_timeout: float | None,
     supports_turn_handling: bool,
 ) -> dict[str, Any]:
@@ -184,6 +194,7 @@ def _build_debug_runtime_snapshot(
         "max_endpointing_delay": max_endpointing_delay,
         "interruption_mode": interruption_mode,
         "interruption_min_duration": interruption_min_duration,
+        "interruption_min_words": interruption_min_words,
         "false_interruption_timeout": false_interruption_timeout,
         "resume_false_interruption": RESUME_FALSE_INTERRUPTION,
         "preemptive_generation": True,
@@ -705,12 +716,13 @@ async def my_agent(ctx: JobContext):
     )
     interruption_mode = _normalize_interruption_mode(None)
     interruption_min_duration = _normalize_interruption_min_duration(None)
+    interruption_min_words = _normalize_interruption_min_words(config.get("interruption_min_words"))
     false_interruption_timeout = _normalize_false_interruption_timeout(None)
     supports_turn_handling = _supports_turn_handling()
     call_context_text = _build_call_context_text(session_config)
 
     logger.info(
-        "[SESSION_CONFIG] tenant=%s config_version=%s language=%s stt_language=%s llm_model=%s tts_speed=%s min_endpointing_delay=%.2f max_endpointing_delay=%.2f interruption_mode=%s interruption_min_duration=%.2f false_interruption_timeout=%s turn_detector=MultilingualModel preemptive_generation=%s",
+        "[SESSION_CONFIG] tenant=%s config_version=%s language=%s stt_language=%s llm_model=%s tts_speed=%s min_endpointing_delay=%.2f max_endpointing_delay=%.2f interruption_mode=%s interruption_min_duration=%.2f interruption_min_words=%s false_interruption_timeout=%s turn_detector=MultilingualModel preemptive_generation=%s",
         tenant.get("slug"),
         config.get("version"),
         assistant_language,
@@ -721,10 +733,11 @@ async def my_agent(ctx: JobContext):
         max_endpointing_delay,
         interruption_mode,
         interruption_min_duration,
+        interruption_min_words,
         false_interruption_timeout,
         True,
     )
-    debug_logger.log("call", "session_started", room_name=ctx.room.name, tenant_slug=tenant.get("slug"), config_version=config.get("version"), business_timezone=business_timezone, assistant_language=assistant_language, stt_language=stt_language, llm_model=llm_model, tts_voice=tts_voice, tts_speed=tts_speed, min_endpointing_delay=min_endpointing_delay, max_endpointing_delay=max_endpointing_delay, interruption_mode=interruption_mode, interruption_min_duration=interruption_min_duration, false_interruption_timeout=false_interruption_timeout)
+    debug_logger.log("call", "session_started", room_name=ctx.room.name, tenant_slug=tenant.get("slug"), config_version=config.get("version"), business_timezone=business_timezone, assistant_language=assistant_language, stt_language=stt_language, llm_model=llm_model, tts_voice=tts_voice, tts_speed=tts_speed, min_endpointing_delay=min_endpointing_delay, max_endpointing_delay=max_endpointing_delay, interruption_mode=interruption_mode, interruption_min_duration=interruption_min_duration, interruption_min_words=interruption_min_words, false_interruption_timeout=false_interruption_timeout)
     debug_logger.log(
         "config",
         "runtime_snapshot",
@@ -741,6 +754,7 @@ async def my_agent(ctx: JobContext):
             max_endpointing_delay=max_endpointing_delay,
             interruption_mode=interruption_mode,
             interruption_min_duration=interruption_min_duration,
+            interruption_min_words=interruption_min_words,
             false_interruption_timeout=false_interruption_timeout,
             supports_turn_handling=supports_turn_handling,
         ),
@@ -762,6 +776,7 @@ async def my_agent(ctx: JobContext):
             "interruption": {
                 "mode": interruption_mode,
                 "min_duration": interruption_min_duration,
+                "min_words": interruption_min_words,
                 "resume_false_interruption": RESUME_FALSE_INTERRUPTION,
                 "false_interruption_timeout": false_interruption_timeout,
             },
@@ -848,7 +863,7 @@ async def my_agent(ctx: JobContext):
             logger.exception("[CALL_END] transcript send failed room=%s reason=%s", ctx.room.name, reason)
         finally:
             debug_logger.log("call", "shutdown_finished", room_name=ctx.room.name, reason=reason)
-            debug_logger.close(cleanup=True)
+            debug_logger.close(cleanup=False)
 
     ctx.add_shutdown_callback(_send_transcript_on_shutdown)
 
