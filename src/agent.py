@@ -497,12 +497,21 @@ def _build_instructions(session_config: dict[str, Any], call_context_text: str) 
 
 
 class Assistant(Agent):
-    def __init__(self, session_config: dict[str, Any], call_context_text: str, debug_logger: Optional[CallDebugLogger] = None) -> None:
+    def __init__(
+        self,
+        session_config: dict[str, Any],
+        call_context_text: str,
+        *,
+        bridge_filler_text: str = "",
+        debug_logger: Optional[CallDebugLogger] = None,
+    ) -> None:
         self._call_end_in_progress = False
         self._debug_logger = debug_logger
         self._tenant_id = str(session_config["tenant"]["id"])
         self._business_name = str(session_config["config"].get("business_name") or session_config["tenant"].get("display_name") or "the business")
         self._assistant_language = str(session_config["config"].get("assistant_language") or "en").strip().lower() or "en"
+        self._bridge_filler_text = str(bridge_filler_text or "").strip()
+        self._bridge_filler_handle: Any = None
         instructions = _build_instructions(session_config, call_context_text)
         super().__init__(instructions=instructions)
 
@@ -513,6 +522,72 @@ class Assistant(Agent):
     def _farewell_text(self) -> str:
         template = FAREWELL_BY_LANGUAGE.get(self._assistant_language, FAREWELL_BY_LANGUAGE["en"])
         return template.format(business_name=self._business_name)
+
+    def _on_bridge_filler_done(self, done_handle: Any) -> None:
+        if self._bridge_filler_handle is done_handle:
+            self._bridge_filler_handle = None
+        self._debug_log(
+            "bridge",
+            "bridge_filler_finished",
+            interrupted=bool(getattr(done_handle, "interrupted", False)),
+            trigger="on_user_turn_completed",
+        )
+
+    def _queue_bridge_filler(self, *, trigger: str, user_text: str = "") -> None:
+        if not self._bridge_filler_text:
+            return
+
+        activity = getattr(self, "_activity", None)
+        session_obj = getattr(activity, "session", None) if activity is not None else None
+        if activity is None or session_obj is None:
+            self._debug_log("bridge", "bridge_filler_unavailable", trigger=trigger, reason="activity_missing")
+            return
+
+        existing_handle = self._bridge_filler_handle
+        if existing_handle is not None and not bool(getattr(existing_handle, "interrupted", False)):
+            self._debug_log("bridge", "bridge_filler_skipped", trigger=trigger, reason="previous_handle_active")
+            return
+
+        try:
+            handle = session_obj.say(
+                self._bridge_filler_text,
+                allow_interruptions=False,
+                add_to_chat_ctx=False,
+            )
+        except Exception as exc:
+            self._debug_log(
+                "bridge",
+                "bridge_filler_error",
+                trigger=trigger,
+                user_text=user_text,
+                error=str(exc),
+            )
+            return
+
+        try:
+            activity._schedule_speech(handle, SpeechHandle.SPEECH_PRIORITY_HIGH, force=True)
+            self._debug_log("bridge", "bridge_filler_priority_boosted", trigger=trigger)
+        except Exception as exc:
+            self._debug_log("bridge", "bridge_filler_priority_boost_failed", trigger=trigger, error=str(exc))
+
+        self._bridge_filler_handle = handle
+        self._debug_log(
+            "bridge",
+            "bridge_filler_queued",
+            trigger=trigger,
+            text=self._bridge_filler_text,
+            user_text=user_text,
+        )
+
+        try:
+            handle.add_done_callback(self._on_bridge_filler_done)
+        except Exception:
+            self._debug_log("bridge", "bridge_filler_done_callback_unavailable", trigger=trigger)
+
+    async def on_user_turn_completed(self, turn_ctx: Any, new_message: Any) -> None:
+        await super().on_user_turn_completed(turn_ctx, new_message)
+        user_text = _event_text_payload(new_message).strip()
+        self._queue_bridge_filler(trigger="on_user_turn_completed", user_text=user_text)
 
     @function_tool
     async def check_meeting_slot(self, context: RunContext, preferred_start_iso: str, duration_minutes: int = 30) -> str:
@@ -819,71 +894,14 @@ async def my_agent(ctx: JobContext):
         )
 
     session = AgentSession(**session_kwargs)
-    bridge_filler_handle: Any = None
-    bridge_filler_emitted_for_turn = False
-
-    def _queue_bridge_filler(trigger: str, *, old_state: str = "", new_state: str = "", user_text: str = "") -> None:
-        nonlocal bridge_filler_handle, bridge_filler_emitted_for_turn
-        if not bridge_filler_text:
-            return
-        if bridge_filler_emitted_for_turn:
-            return
-        try:
-            handle = session.say(
-                bridge_filler_text,
-                allow_interruptions=False,
-                add_to_chat_ctx=False,
-            )
-        except Exception as exc:
-            debug_logger.log(
-                "bridge",
-                "bridge_filler_error",
-                trigger=trigger,
-                old_state=old_state,
-                new_state=new_state,
-                user_text=user_text,
-                error=str(exc),
-            )
-            return
-
-        try:
-            activity = session._next_activity if session._activity.scheduling_paused else session._activity
-            if activity is not None:
-                activity._schedule_speech(handle, SpeechHandle.SPEECH_PRIORITY_HIGH, force=True)
-                debug_logger.log("bridge", "bridge_filler_priority_boosted", trigger=trigger)
-        except Exception as exc:
-            debug_logger.log("bridge", "bridge_filler_priority_boost_failed", trigger=trigger, error=str(exc))
-
-        bridge_filler_handle = handle
-        bridge_filler_emitted_for_turn = True
-        debug_logger.log(
-            "bridge",
-            "bridge_filler_queued",
-            trigger=trigger,
-            text=bridge_filler_text,
-            old_state=old_state,
-            new_state=new_state,
-            user_text=user_text,
-        )
-
-        def _on_bridge_done(done_handle: Any) -> None:
-            nonlocal bridge_filler_handle
-            if bridge_filler_handle is done_handle:
-                bridge_filler_handle = None
-            debug_logger.log(
-                "bridge",
-                "bridge_filler_finished",
-                interrupted=bool(getattr(done_handle, "interrupted", False)),
-                trigger=trigger,
-            )
-
-        try:
-            handle.add_done_callback(_on_bridge_done)
-        except Exception:
-            debug_logger.log("bridge", "bridge_filler_done_callback_unavailable", trigger=trigger)
-
+    assistant = Assistant(
+        session_config=session_config,
+        call_context_text=call_context_text,
+        bridge_filler_text=bridge_filler_text,
+        debug_logger=debug_logger,
+    )
     await session.start(
-        agent=Assistant(session_config=session_config, call_context_text=call_context_text, debug_logger=debug_logger),
+        agent=assistant,
         room=ctx.room,
         room_options=room_io.RoomOptions(
             audio_input=room_io.AudioInputOptions(
@@ -894,25 +912,17 @@ async def my_agent(ctx: JobContext):
 
     @session.on("user_state_changed")
     def _on_user_state_changed(ev: Any) -> None:
-        nonlocal bridge_filler_emitted_for_turn
         old_state = str(getattr(ev, "old_state", ""))
         new_state = str(getattr(ev, "new_state", ""))
         debug_logger.log("turn", "user_state_changed", old_state=old_state, new_state=new_state)
-        if new_state.lower().endswith("speaking"):
-            if bridge_filler_emitted_for_turn and bridge_filler_handle is None:
-                bridge_filler_emitted_for_turn = False
-                debug_logger.log("bridge", "bridge_filler_rearmed", reason="user_resumed_speaking")
         if new_state.lower().endswith("listening"):
             debug_logger.log("turn", "USER_STOPPED_SPEAKING", old_state=old_state, new_state=new_state)
 
     @session.on("agent_state_changed")
     def _on_agent_state_changed(ev: Any) -> None:
-        nonlocal bridge_filler_emitted_for_turn
         old_state = str(getattr(ev, "old_state", ""))
         new_state = str(getattr(ev, "new_state", ""))
         debug_logger.log("agent", "agent_state_changed", old_state=old_state, new_state=new_state)
-        if new_state.lower().endswith("speaking"):
-            bridge_filler_emitted_for_turn = False
 
     @session.on("user_input_transcribed")
     def _on_user_input_transcribed(ev: Any) -> None:
@@ -928,8 +938,6 @@ async def my_agent(ctx: JobContext):
         text = _event_text_payload(item).strip()
         if role in ("user", "assistant") and text:
             debug_logger.log("transcript", "USER_COMMITTED" if role == "user" else "ASSISTANT_COMMITTED", text=text)
-            if role == "user":
-                _queue_bridge_filler("user_committed", user_text=text)
 
     @session.on("function_tools_executed")
     def _on_function_tools_executed(ev: Any) -> None:
