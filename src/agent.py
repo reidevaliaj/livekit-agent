@@ -25,6 +25,7 @@ from livekit.agents import (
 )
 from livekit.plugins import cartesia, deepgram, noise_cancellation, openai, silero
 from livekit.plugins.turn_detector.multilingual import MultilingualModel
+from livekit.agents.voice.speech_handle import SpeechHandle
 
 from call_debug import CallDebugLogger
 
@@ -821,7 +822,7 @@ async def my_agent(ctx: JobContext):
     bridge_filler_handle: Any = None
     bridge_filler_emitted_for_turn = False
 
-    def _queue_bridge_filler(trigger: str, *, old_state: str = "", new_state: str = "") -> None:
+    def _queue_bridge_filler(trigger: str, *, old_state: str = "", new_state: str = "", user_text: str = "") -> None:
         nonlocal bridge_filler_handle, bridge_filler_emitted_for_turn
         if not bridge_filler_text:
             return
@@ -830,7 +831,7 @@ async def my_agent(ctx: JobContext):
         try:
             handle = session.say(
                 bridge_filler_text,
-                allow_interruptions=True,
+                allow_interruptions=False,
                 add_to_chat_ctx=False,
             )
         except Exception as exc:
@@ -840,9 +841,18 @@ async def my_agent(ctx: JobContext):
                 trigger=trigger,
                 old_state=old_state,
                 new_state=new_state,
+                user_text=user_text,
                 error=str(exc),
             )
             return
+
+        try:
+            activity = session._next_activity if session._activity.scheduling_paused else session._activity
+            if activity is not None:
+                activity._schedule_speech(handle, SpeechHandle.SPEECH_PRIORITY_HIGH, force=True)
+                debug_logger.log("bridge", "bridge_filler_priority_boosted", trigger=trigger)
+        except Exception as exc:
+            debug_logger.log("bridge", "bridge_filler_priority_boost_failed", trigger=trigger, error=str(exc))
 
         bridge_filler_handle = handle
         bridge_filler_emitted_for_turn = True
@@ -853,6 +863,7 @@ async def my_agent(ctx: JobContext):
             text=bridge_filler_text,
             old_state=old_state,
             new_state=new_state,
+            user_text=user_text,
         )
 
         def _on_bridge_done(done_handle: Any) -> None:
@@ -893,8 +904,6 @@ async def my_agent(ctx: JobContext):
                 debug_logger.log("bridge", "bridge_filler_rearmed", reason="user_resumed_speaking")
         if new_state.lower().endswith("listening"):
             debug_logger.log("turn", "USER_STOPPED_SPEAKING", old_state=old_state, new_state=new_state)
-            if old_state.lower().endswith("speaking"):
-                _queue_bridge_filler("user_stopped_speaking", old_state=old_state, new_state=new_state)
 
     @session.on("agent_state_changed")
     def _on_agent_state_changed(ev: Any) -> None:
@@ -919,6 +928,8 @@ async def my_agent(ctx: JobContext):
         text = _event_text_payload(item).strip()
         if role in ("user", "assistant") and text:
             debug_logger.log("transcript", "USER_COMMITTED" if role == "user" else "ASSISTANT_COMMITTED", text=text)
+            if role == "user":
+                _queue_bridge_filler("user_committed", user_text=text)
 
     @session.on("function_tools_executed")
     def _on_function_tools_executed(ev: Any) -> None:
