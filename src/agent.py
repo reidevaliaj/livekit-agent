@@ -54,7 +54,7 @@ AGENT_LOAD_THRESHOLD = float(os.getenv("AGENT_LOAD_THRESHOLD", "0.95").strip() o
 ENABLE_LLM_WARMUP = os.getenv("ENABLE_LLM_WARMUP", "false").strip().lower() == "true"
 LLM_WARMUP_TIMEOUT_SEC = float(os.getenv("LLM_WARMUP_TIMEOUT_SEC", "3.5").strip() or "3.5")
 LLM_WARMUP_MODEL = (os.getenv("LLM_WARMUP_MODEL", "gpt-4.1-nano").strip() or "gpt-4.1-nano")
-ENABLE_INCOMING_BRIDGE_FILLER = os.getenv("ENABLE_INCOMING_BRIDGE_FILLER", "true").strip().lower() == "true"
+DEFAULT_INCOMING_BRIDGE_FILLER_ENABLED = os.getenv("ENABLE_INCOMING_BRIDGE_FILLER", "false").strip().lower() == "true"
 
 PLATFORM_RULES = """
 Rules:
@@ -802,8 +802,17 @@ async def my_agent(ctx: JobContext):
     false_interruption_timeout = _normalize_false_interruption_timeout(None)
     supports_turn_handling = _supports_turn_handling()
     call_context_text = _build_call_context_text(session_config)
+    incoming_bridge_filler_enabled = bool(
+        config.get(
+            "incoming_bridge_filler_enabled",
+            (config.get("extra_settings") or {}).get(
+                "incoming_bridge_filler_enabled",
+                DEFAULT_INCOMING_BRIDGE_FILLER_ENABLED,
+            ),
+        )
+    )
     bridge_filler_text = ""
-    if ENABLE_INCOMING_BRIDGE_FILLER:
+    if incoming_bridge_filler_enabled:
         bridge_filler_text = str(BRIDGE_FILLER_BY_LANGUAGE.get(assistant_language, "") or "").strip()
     preemptive_generation_enabled = not bool(bridge_filler_text)
 
