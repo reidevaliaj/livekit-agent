@@ -584,6 +584,9 @@ class Assistant(Agent):
         except Exception:
             self._debug_log("bridge", "bridge_filler_done_callback_unavailable", trigger=trigger)
 
+    def on_user_stopped_speaking(self) -> None:
+        self._queue_bridge_filler(trigger="user_stopped_speaking")
+
     async def on_user_turn_completed(self, turn_ctx: Any, new_message: Any) -> None:
         await super().on_user_turn_completed(turn_ctx, new_message)
         user_text = _event_text_payload(new_message).strip()
@@ -917,6 +920,7 @@ async def my_agent(ctx: JobContext):
         debug_logger.log("turn", "user_state_changed", old_state=old_state, new_state=new_state)
         if new_state.lower().endswith("listening"):
             debug_logger.log("turn", "USER_STOPPED_SPEAKING", old_state=old_state, new_state=new_state)
+            assistant.on_user_stopped_speaking()
 
     @session.on("agent_state_changed")
     def _on_agent_state_changed(ev: Any) -> None:
