@@ -53,6 +53,7 @@ AGENT_LOAD_THRESHOLD = float(os.getenv("AGENT_LOAD_THRESHOLD", "0.95").strip() o
 ENABLE_LLM_WARMUP = os.getenv("ENABLE_LLM_WARMUP", "false").strip().lower() == "true"
 LLM_WARMUP_TIMEOUT_SEC = float(os.getenv("LLM_WARMUP_TIMEOUT_SEC", "3.5").strip() or "3.5")
 LLM_WARMUP_MODEL = (os.getenv("LLM_WARMUP_MODEL", "gpt-4.1-nano").strip() or "gpt-4.1-nano")
+ENABLE_INCOMING_BRIDGE_FILLER = os.getenv("ENABLE_INCOMING_BRIDGE_FILLER", "true").strip().lower() == "true"
 
 PLATFORM_RULES = """
 Rules:
@@ -80,6 +81,9 @@ FAREWELL_BY_LANGUAGE = {
     "en": "Thank you for calling {business_name}. Goodbye.",
     "it": "Grazie per aver chiamato {business_name}. Arrivederci.",
     "de": "Vielen Dank fuer Ihren Anruf bei {business_name}. Auf Wiedersehen.",
+}
+BRIDGE_FILLER_BY_LANGUAGE = {
+    "it": "Si certo capisco.",
 }
 SUPPORTED_STT_LANGUAGES = {"en", "it", "de", "multi"}
 SUPPORTED_INTERRUPTION_MODES = {"adaptive", "vad"}
@@ -176,6 +180,8 @@ def _build_debug_runtime_snapshot(
     interruption_min_words: int,
     false_interruption_timeout: float | None,
     supports_turn_handling: bool,
+    preemptive_generation_enabled: bool,
+    bridge_filler_text: str,
 ) -> dict[str, Any]:
     return {
         "tenant_slug": tenant.get("slug"),
@@ -196,7 +202,8 @@ def _build_debug_runtime_snapshot(
         "interruption_min_words": interruption_min_words,
         "false_interruption_timeout": false_interruption_timeout,
         "resume_false_interruption": RESUME_FALSE_INTERRUPTION,
-        "preemptive_generation": True,
+        "preemptive_generation": preemptive_generation_enabled,
+        "bridge_filler_text": bridge_filler_text,
         "meeting_duration_minutes": int(config.get("meeting_duration_minutes") or 30),
         "booking_horizon_days": int(config.get("booking_horizon_days") or 14),
         "enabled_tools": dict(config.get("enabled_tools") or {}),
@@ -719,9 +726,13 @@ async def my_agent(ctx: JobContext):
     false_interruption_timeout = _normalize_false_interruption_timeout(None)
     supports_turn_handling = _supports_turn_handling()
     call_context_text = _build_call_context_text(session_config)
+    bridge_filler_text = ""
+    if ENABLE_INCOMING_BRIDGE_FILLER:
+        bridge_filler_text = str(BRIDGE_FILLER_BY_LANGUAGE.get(assistant_language, "") or "").strip()
+    preemptive_generation_enabled = not bool(bridge_filler_text)
 
     logger.info(
-        "[SESSION_CONFIG] tenant=%s config_version=%s language=%s stt_language=%s llm_model=%s tts_speed=%s min_endpointing_delay=%.2f max_endpointing_delay=%.2f interruption_mode=%s interruption_min_duration=%.2f interruption_min_words=%s false_interruption_timeout=%s turn_detector=MultilingualModel preemptive_generation=%s",
+        "[SESSION_CONFIG] tenant=%s config_version=%s language=%s stt_language=%s llm_model=%s tts_speed=%s min_endpointing_delay=%.2f max_endpointing_delay=%.2f interruption_mode=%s interruption_min_duration=%.2f interruption_min_words=%s false_interruption_timeout=%s turn_detector=MultilingualModel preemptive_generation=%s bridge_filler=%s",
         tenant.get("slug"),
         config.get("version"),
         assistant_language,
@@ -734,7 +745,8 @@ async def my_agent(ctx: JobContext):
         interruption_min_duration,
         interruption_min_words,
         false_interruption_timeout,
-        True,
+        preemptive_generation_enabled,
+        bridge_filler_text or "(disabled)",
     )
     debug_logger.log("call", "session_started", room_name=ctx.room.name, tenant_slug=tenant.get("slug"), config_version=config.get("version"), business_timezone=business_timezone, assistant_language=assistant_language, stt_language=stt_language, llm_model=llm_model, tts_voice=tts_voice, tts_speed=tts_speed, min_endpointing_delay=min_endpointing_delay, max_endpointing_delay=max_endpointing_delay, interruption_mode=interruption_mode, interruption_min_duration=interruption_min_duration, interruption_min_words=interruption_min_words, false_interruption_timeout=false_interruption_timeout)
     debug_logger.log(
@@ -756,8 +768,17 @@ async def my_agent(ctx: JobContext):
             interruption_min_words=interruption_min_words,
             false_interruption_timeout=false_interruption_timeout,
             supports_turn_handling=supports_turn_handling,
+            preemptive_generation_enabled=preemptive_generation_enabled,
+            bridge_filler_text=bridge_filler_text,
         ),
     )
+    if bridge_filler_text:
+        debug_logger.log(
+            "config",
+            "bridge_filler_enabled",
+            text=bridge_filler_text,
+            preemptive_generation=preemptive_generation_enabled,
+        )
 
     session_kwargs: Dict[str, Any] = {
         "stt": deepgram.STT(model="nova-3", language=stt_language),
@@ -780,7 +801,7 @@ async def my_agent(ctx: JobContext):
                 "false_interruption_timeout": false_interruption_timeout,
             },
             "preemptive_generation": {
-                "enabled": True,
+                "enabled": preemptive_generation_enabled,
             },
         }
     else:
@@ -793,10 +814,62 @@ async def my_agent(ctx: JobContext):
             min_interruption_duration=interruption_min_duration,
             false_interruption_timeout=false_interruption_timeout,
             resume_false_interruption=RESUME_FALSE_INTERRUPTION,
-            preemptive_generation=True,
+            preemptive_generation=preemptive_generation_enabled,
         )
 
     session = AgentSession(**session_kwargs)
+    bridge_filler_handle: Any = None
+    bridge_filler_emitted_for_turn = False
+
+    def _queue_bridge_filler(trigger: str, *, old_state: str = "", new_state: str = "") -> None:
+        nonlocal bridge_filler_handle, bridge_filler_emitted_for_turn
+        if not bridge_filler_text:
+            return
+        if bridge_filler_emitted_for_turn:
+            return
+        try:
+            handle = session.say(
+                bridge_filler_text,
+                allow_interruptions=True,
+                add_to_chat_ctx=False,
+            )
+        except Exception as exc:
+            debug_logger.log(
+                "bridge",
+                "bridge_filler_error",
+                trigger=trigger,
+                old_state=old_state,
+                new_state=new_state,
+                error=str(exc),
+            )
+            return
+
+        bridge_filler_handle = handle
+        bridge_filler_emitted_for_turn = True
+        debug_logger.log(
+            "bridge",
+            "bridge_filler_queued",
+            trigger=trigger,
+            text=bridge_filler_text,
+            old_state=old_state,
+            new_state=new_state,
+        )
+
+        def _on_bridge_done(done_handle: Any) -> None:
+            nonlocal bridge_filler_handle
+            if bridge_filler_handle is done_handle:
+                bridge_filler_handle = None
+            debug_logger.log(
+                "bridge",
+                "bridge_filler_finished",
+                interrupted=bool(getattr(done_handle, "interrupted", False)),
+                trigger=trigger,
+            )
+
+        try:
+            handle.add_done_callback(_on_bridge_done)
+        except Exception:
+            debug_logger.log("bridge", "bridge_filler_done_callback_unavailable", trigger=trigger)
 
     await session.start(
         agent=Assistant(session_config=session_config, call_context_text=call_context_text, debug_logger=debug_logger),
@@ -810,15 +883,27 @@ async def my_agent(ctx: JobContext):
 
     @session.on("user_state_changed")
     def _on_user_state_changed(ev: Any) -> None:
+        nonlocal bridge_filler_emitted_for_turn
         old_state = str(getattr(ev, "old_state", ""))
         new_state = str(getattr(ev, "new_state", ""))
         debug_logger.log("turn", "user_state_changed", old_state=old_state, new_state=new_state)
+        if new_state.lower().endswith("speaking"):
+            if bridge_filler_emitted_for_turn and bridge_filler_handle is None:
+                bridge_filler_emitted_for_turn = False
+                debug_logger.log("bridge", "bridge_filler_rearmed", reason="user_resumed_speaking")
         if new_state.lower().endswith("listening"):
             debug_logger.log("turn", "USER_STOPPED_SPEAKING", old_state=old_state, new_state=new_state)
+            if old_state.lower().endswith("speaking"):
+                _queue_bridge_filler("user_stopped_speaking", old_state=old_state, new_state=new_state)
 
     @session.on("agent_state_changed")
     def _on_agent_state_changed(ev: Any) -> None:
-        debug_logger.log("agent", "agent_state_changed", old_state=str(getattr(ev, "old_state", "")), new_state=str(getattr(ev, "new_state", "")))
+        nonlocal bridge_filler_emitted_for_turn
+        old_state = str(getattr(ev, "old_state", ""))
+        new_state = str(getattr(ev, "new_state", ""))
+        debug_logger.log("agent", "agent_state_changed", old_state=old_state, new_state=new_state)
+        if new_state.lower().endswith("speaking"):
+            bridge_filler_emitted_for_turn = False
 
     @session.on("user_input_transcribed")
     def _on_user_input_transcribed(ev: Any) -> None:
