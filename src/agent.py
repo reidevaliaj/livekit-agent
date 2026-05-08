@@ -4,6 +4,7 @@ import json
 import logging
 import os
 import time
+from collections.abc import Awaitable, Callable
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Optional
 from zoneinfo import ZoneInfo
@@ -23,11 +24,11 @@ from livekit.agents import (
     get_job_context,
     room_io,
 )
-from openai.types.beta.realtime.session import InputAudioTranscription, TurnDetection
-from livekit.plugins import cartesia, deepgram, noise_cancellation, openai, silero
-from livekit.plugins.turn_detector.multilingual import MultilingualModel
+from livekit.plugins import noise_cancellation, silero
 from livekit.agents.voice.speech_handle import SpeechHandle
 
+from agent_realtime import build_realtime_session, speak_realtime_text
+from agent_standard import build_standard_session, speak_standard_text
 from call_debug import CallDebugLogger
 
 logger = logging.getLogger("agent")
@@ -94,7 +95,6 @@ BRIDGE_FILLER_BY_LANGUAGE = {
 SUPPORTED_STT_LANGUAGES = {"en", "it", "de", "multi"}
 SUPPORTED_INTERRUPTION_MODES = {"adaptive", "vad"}
 SUPPORTED_INCOMING_RUNTIME_MODES = {"standard", "openai_realtime_test"}
-SUPPORTED_REALTIME_TRANSCRIPTION_LANGUAGES = {"en", "it", "de"}
 
 
 def _normalize_tts_speed(value: Any) -> float:
@@ -167,36 +167,6 @@ def _normalize_endpointing_window(min_value: Any, max_value: Any) -> tuple[float
 def _normalize_incoming_runtime_mode(value: Any) -> str:
     candidate = str(value or "standard").strip().lower()
     return candidate if candidate in SUPPORTED_INCOMING_RUNTIME_MODES else "standard"
-
-
-def _realtime_transcription_language(stt_language: str, assistant_language: str) -> str | None:
-    if stt_language in SUPPORTED_REALTIME_TRANSCRIPTION_LANGUAGES:
-        return stt_language
-    if assistant_language in SUPPORTED_REALTIME_TRANSCRIPTION_LANGUAGES:
-        return assistant_language
-    return None
-
-
-async def _speak_fixed_text(
-    session: AgentSession,
-    text: str,
-    *,
-    runtime_mode: str,
-    allow_interruptions: bool = True,
-) -> None:
-    if runtime_mode == "openai_realtime_test":
-        handle = session.generate_reply(
-            instructions=(
-                "Speak to the caller now. Keep it short and natural. "
-                f"Say this message faithfully in one turn: {text}"
-            ),
-            allow_interruptions=allow_interruptions,
-            input_modality="text",
-        )
-        await handle
-        return
-
-    await session.say(text, allow_interruptions=allow_interruptions)
 
 
 def _supports_turn_handling() -> bool:
@@ -551,7 +521,7 @@ class Assistant(Agent):
         session_config: dict[str, Any],
         call_context_text: str,
         *,
-        incoming_runtime_mode: str = "standard",
+        speak_text_fn: Callable[..., Awaitable[None]],
         bridge_filler_text: str = "",
         debug_logger: Optional[CallDebugLogger] = None,
     ) -> None:
@@ -560,7 +530,7 @@ class Assistant(Agent):
         self._tenant_id = str(session_config["tenant"]["id"])
         self._business_name = str(session_config["config"].get("business_name") or session_config["tenant"].get("display_name") or "the business")
         self._assistant_language = str(session_config["config"].get("assistant_language") or "en").strip().lower() or "en"
-        self._incoming_runtime_mode = _normalize_incoming_runtime_mode(incoming_runtime_mode)
+        self._speak_text_fn = speak_text_fn
         self._bridge_filler_text = str(bridge_filler_text or "").strip()
         self._bridge_filler_handle: Any = None
         instructions = _build_instructions(session_config, call_context_text)
@@ -742,10 +712,9 @@ class Assistant(Agent):
             if session_obj is not None:
                 try:
                     await asyncio.wait_for(
-                        _speak_fixed_text(
+                        self._speak_text_fn(
                             session_obj,
                             self._farewell_text(),
-                            runtime_mode=self._incoming_runtime_mode,
                             allow_interruptions=False,
                         ),
                         timeout=8.0,
@@ -953,79 +922,44 @@ async def my_agent(ctx: JobContext):
             preemptive_generation=preemptive_generation_enabled,
         )
 
-    session_kwargs: Dict[str, Any]
     if incoming_runtime_mode == "openai_realtime_test":
-        realtime_transcription_kwargs: dict[str, Any] = {
-            "model": "gpt-4o-mini-transcribe",
-        }
-        realtime_language = _realtime_transcription_language(stt_language, assistant_language)
-        if realtime_language:
-            realtime_transcription_kwargs["language"] = realtime_language
-
-        session_kwargs = {
-            "llm": openai.realtime.RealtimeModel(
-                model=incoming_realtime_model,
-                voice=incoming_realtime_voice,
-                input_audio_transcription=InputAudioTranscription(**realtime_transcription_kwargs),
-                input_audio_noise_reduction="near_field",
-                turn_detection=TurnDetection(
-                    type="semantic_vad",
-                    eagerness="high",
-                    create_response=True,
-                    interrupt_response=True,
-                ),
-            ),
-            "allow_interruptions": True,
-            "discard_audio_if_uninterruptible": True,
-            "min_interruption_duration": interruption_min_duration,
-            "min_interruption_words": interruption_min_words,
-            "false_interruption_timeout": false_interruption_timeout,
-            "resume_false_interruption": RESUME_FALSE_INTERRUPTION,
-            "preemptive_generation": False,
-        }
+        session = build_realtime_session(
+            incoming_realtime_model=incoming_realtime_model,
+            incoming_realtime_voice=incoming_realtime_voice,
+            stt_language=stt_language,
+            assistant_language=assistant_language,
+            interruption_min_duration=interruption_min_duration,
+            interruption_min_words=interruption_min_words,
+            false_interruption_timeout=false_interruption_timeout,
+            resume_false_interruption=RESUME_FALSE_INTERRUPTION,
+        )
+        speak_text_fn = speak_realtime_text
     else:
-        session_kwargs = {
-            "stt": deepgram.STT(model="nova-3", language=stt_language),
-            "llm": openai.LLM(model=llm_model),
-            "tts": cartesia.TTS(model="sonic-3", voice=tts_voice, language=assistant_language, speed=tts_speed),
-            "vad": ctx.proc.userdata["vad"],
-        }
-        if supports_turn_handling:
-            session_kwargs["turn_handling"] = {
-                "turn_detection": MultilingualModel(),
-                "endpointing": {
-                    "min_delay": min_endpointing_delay,
-                    "max_delay": max_endpointing_delay,
-                },
-                "interruption": {
-                    "mode": interruption_mode,
-                    "min_duration": interruption_min_duration,
-                    "min_words": interruption_min_words,
-                    "resume_false_interruption": RESUME_FALSE_INTERRUPTION,
-                    "false_interruption_timeout": false_interruption_timeout,
-                },
-                "preemptive_generation": {
-                    "enabled": preemptive_generation_enabled,
-                },
-            }
-        else:
-            if interruption_mode == "adaptive":
-                logger.warning("[SESSION_CONFIG] adaptive interruption requested but current SDK does not support turn_handling; falling back to legacy interruption handling")
-            session_kwargs.update(
-                turn_detection=MultilingualModel(),
-                min_endpointing_delay=min_endpointing_delay,
-                max_endpointing_delay=max_endpointing_delay,
-                min_interruption_duration=interruption_min_duration,
-                false_interruption_timeout=false_interruption_timeout,
-                resume_false_interruption=RESUME_FALSE_INTERRUPTION,
-                preemptive_generation=preemptive_generation_enabled,
-            )
+        if not supports_turn_handling and interruption_mode == "adaptive":
+            logger.warning("[SESSION_CONFIG] adaptive interruption requested but current SDK does not support turn_handling; falling back to legacy interruption handling")
+        session = build_standard_session(
+            vad_model=ctx.proc.userdata["vad"],
+            assistant_language=assistant_language,
+            stt_language=stt_language,
+            llm_model=llm_model,
+            tts_voice=tts_voice,
+            tts_speed=tts_speed,
+            supports_turn_handling=supports_turn_handling,
+            min_endpointing_delay=min_endpointing_delay,
+            max_endpointing_delay=max_endpointing_delay,
+            interruption_mode=interruption_mode,
+            interruption_min_duration=interruption_min_duration,
+            interruption_min_words=interruption_min_words,
+            false_interruption_timeout=false_interruption_timeout,
+            preemptive_generation_enabled=preemptive_generation_enabled,
+            resume_false_interruption=RESUME_FALSE_INTERRUPTION,
+        )
+        speak_text_fn = speak_standard_text
 
-    session = AgentSession(**session_kwargs)
     assistant = Assistant(
         session_config=session_config,
         call_context_text=call_context_text,
-        incoming_runtime_mode=incoming_runtime_mode,
+        speak_text_fn=speak_text_fn,
         bridge_filler_text=bridge_filler_text,
         debug_logger=debug_logger,
     )
@@ -1103,10 +1037,9 @@ async def my_agent(ctx: JobContext):
         asyncio.create_task(_warmup_llm_once())
 
     greeting = str(config.get("greeting") or f"Thanks for calling {config.get('business_name')}. How may we help you today?")
-    await _speak_fixed_text(
+    await speak_text_fn(
         session,
         greeting,
-        runtime_mode=incoming_runtime_mode,
         allow_interruptions=True,
     )
 
