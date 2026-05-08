@@ -677,53 +677,12 @@ class Assistant(Agent):
             self._debug_log("tool", "call_end.start", call_type=call_type, name=name, company=company, contact_email=contact_email, contact_phone=contact_phone, topic=topic, notes=notes, urgency=urgency, preferred_time_window=preferred_time_window)
             ctx: JobContext = get_job_context()
             room = ctx.room
-            session_obj = getattr(context, "session", None)
-            transcript = ""
-            if session_obj is not None:
-                try:
-                    history_payload = _build_transcript_payload(session_obj, room, "call_end_requested", self._tenant_id)
-                    transcript = history_payload.get("transcript", "")
-                except Exception:
-                    logger.exception("[CALL_END_TOOL] failed to collect transcript context")
-
-            decision = await _post_json_and_read("/tools/validate-call-end", {"tenant_id": self._tenant_id, "transcript": transcript})
-            self._debug_log("tool", "call_end.validation_response", decision=decision)
-            if not bool(decision.get("end_call", 0)):
-                result_text = "I can keep helping. If you want to finish now, please say a clear ending like 'that's all, thank you' or 'goodbye'."
-                self._debug_log("tool", "call_end.result", result=result_text)
-                return result_text
 
             payload = {"tenant_id": self._tenant_id, "call_type": call_type, "name": name, "company": company, "contact_email": contact_email, "contact_phone": contact_phone, "topic": topic, "notes": notes, "urgency": urgency, "preferred_time_window": preferred_time_window, "room_name": room.name if room else None, "caller_id": _best_effort_caller_id(room) if room else None, "timestamp": int(time.time())}
             self._debug_log("tool", "call_end.event_payload", payload=payload)
             await _post_json("/events/call-end", payload)
-
-            sip_identities: list[str] = []
-            try:
-                for participant in room.remote_participants.values():
-                    identity = (participant.identity or "").strip()
-                    is_sip = participant.kind == rtc.ParticipantKind.PARTICIPANT_KIND_SIP or "sip" in identity.lower()
-                    if identity and is_sip:
-                        sip_identities.append(identity)
-                if sip_identities:
-                    logger.info("[CALL_END_TOOL] sip participants queued for kick count=%s ids=%s", len(sip_identities), sip_identities)
-            except Exception:
-                logger.exception("[CALL_END_TOOL] failed to snapshot SIP participants")
-
-            if session_obj is not None:
-                try:
-                    await asyncio.wait_for(
-                        self._speak_text_fn(
-                            session_obj,
-                            self._farewell_text(),
-                            allow_interruptions=False,
-                        ),
-                        timeout=8.0,
-                    )
-                    logger.info("[CALL_END_TOOL] farewell spoken before disconnect")
-                except asyncio.TimeoutError:
-                    logger.warning("[CALL_END_TOOL] farewell timed out; disconnecting anyway")
-                except Exception:
-                    logger.exception("[CALL_END_TOOL] farewell speak failed; disconnecting anyway")
+            self._debug_log("tool", "call_end.disconnect_scheduled", delay_seconds=2.0)
+            await asyncio.sleep(2.0)
 
             try:
                 await ctx.room.disconnect()
@@ -736,48 +695,7 @@ class Assistant(Agent):
                 except Exception:
                     logger.exception("[CALL_END_TOOL] ctx.shutdown failed")
 
-            if sip_identities:
-                room_api = getattr(getattr(ctx, "api", None), "room", None)
-                remove_participant = getattr(room_api, "remove_participant", None)
-                if callable(remove_participant):
-                    try:
-                        logger.info("[CALL_END_TOOL] remove_participant signature=%s", str(inspect.signature(remove_participant)))
-                    except Exception:
-                        logger.info("[CALL_END_TOOL] remove_participant signature=unavailable")
-                    for identity in sip_identities:
-                        kicked = False
-                        room_name = room.name if room else ""
-                        attempts = []
-                        try:
-                            from livekit.api import RoomParticipantIdentity  # type: ignore
-                            attempts.append(lambda: remove_participant(RoomParticipantIdentity(room=room_name, identity=identity)))
-                        except Exception:
-                            pass
-                        attempts.extend([
-                            lambda: remove_participant(room=room_name, identity=identity),
-                            lambda: remove_participant(room_name=room_name, identity=identity),
-                            lambda: remove_participant(room=room_name, participant_identity=identity),
-                            lambda: remove_participant(room_name=room_name, participant_identity=identity),
-                        ])
-                        for attempt in attempts:
-                            try:
-                                result = attempt()
-                                if inspect.isawaitable(result):
-                                    await result
-                                logger.info("[CALL_END_TOOL] kicked SIP participant identity=%s", identity)
-                                kicked = True
-                                break
-                            except TypeError:
-                                continue
-                            except Exception:
-                                logger.exception("[CALL_END_TOOL] failed to kick SIP participant identity=%s", identity)
-                                break
-                        if not kicked:
-                            logger.error("[CALL_END_TOOL] unable to kick SIP participant identity=%s", identity)
-                else:
-                    logger.warning("[CALL_END_TOOL] ctx.api.room.remove_participant unavailable; SIP kick skipped")
-
-            result_text = "Saved. I sent the details to the team."
+            result_text = "Ending the call now."
             self._debug_log("tool", "call_end.result", result=result_text)
             return result_text
         except Exception as exc:
