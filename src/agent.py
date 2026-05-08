@@ -681,8 +681,56 @@ class Assistant(Agent):
             payload = {"tenant_id": self._tenant_id, "call_type": call_type, "name": name, "company": company, "contact_email": contact_email, "contact_phone": contact_phone, "topic": topic, "notes": notes, "urgency": urgency, "preferred_time_window": preferred_time_window, "room_name": room.name if room else None, "caller_id": _best_effort_caller_id(room) if room else None, "timestamp": int(time.time())}
             self._debug_log("tool", "call_end.event_payload", payload=payload)
             await _post_json("/events/call-end", payload)
+
+            sip_identities: list[str] = []
+            try:
+                for participant in room.remote_participants.values():
+                    identity = (participant.identity or "").strip()
+                    is_sip = participant.kind == rtc.ParticipantKind.PARTICIPANT_KIND_SIP or "sip" in identity.lower()
+                    if identity and is_sip:
+                        sip_identities.append(identity)
+            except Exception:
+                logger.exception("[CALL_END_TOOL] failed to snapshot SIP participants")
+
             self._debug_log("tool", "call_end.disconnect_scheduled", delay_seconds=2.0)
             await asyncio.sleep(2.0)
+
+            if sip_identities:
+                room_api = getattr(getattr(ctx, "api", None), "room", None)
+                remove_participant = getattr(room_api, "remove_participant", None)
+                if callable(remove_participant):
+                    for identity in sip_identities:
+                        kicked = False
+                        room_name = room.name if room else ""
+                        attempts = []
+                        try:
+                            from livekit.api import RoomParticipantIdentity  # type: ignore
+                            attempts.append(lambda: remove_participant(RoomParticipantIdentity(room=room_name, identity=identity)))
+                        except Exception:
+                            pass
+                        attempts.extend([
+                            lambda: remove_participant(room=room_name, identity=identity),
+                            lambda: remove_participant(room_name=room_name, identity=identity),
+                            lambda: remove_participant(room=room_name, participant_identity=identity),
+                            lambda: remove_participant(room_name=room_name, participant_identity=identity),
+                        ])
+                        for attempt in attempts:
+                            try:
+                                result = attempt()
+                                if inspect.isawaitable(result):
+                                    await result
+                                kicked = True
+                                self._debug_log("tool", "call_end.sip_participant_removed", identity=identity)
+                                break
+                            except TypeError:
+                                continue
+                            except Exception as exc:
+                                self._debug_log("tool", "call_end.sip_participant_remove_failed", identity=identity, error=str(exc))
+                                break
+                        if not kicked:
+                            self._debug_log("tool", "call_end.sip_participant_remove_skipped", identity=identity)
+                else:
+                    self._debug_log("tool", "call_end.sip_participant_remove_unavailable")
 
             try:
                 await ctx.room.disconnect()
