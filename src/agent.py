@@ -533,6 +533,8 @@ class Assistant(Agent):
         self._speak_text_fn = speak_text_fn
         self._bridge_filler_text = str(bridge_filler_text or "").strip()
         self._bridge_filler_handle: Any = None
+        self._latest_agent_state = "listening"
+        self._latest_agent_state_changed_at = time.monotonic()
         instructions = _build_instructions(session_config, call_context_text)
         super().__init__(instructions=instructions)
 
@@ -543,6 +545,10 @@ class Assistant(Agent):
     def _farewell_text(self) -> str:
         template = FAREWELL_BY_LANGUAGE.get(self._assistant_language, FAREWELL_BY_LANGUAGE["en"])
         return template.format(business_name=self._business_name)
+
+    def note_agent_state(self, new_state: str) -> None:
+        self._latest_agent_state = str(new_state or "")
+        self._latest_agent_state_changed_at = time.monotonic()
 
     def _on_bridge_filler_done(self, done_handle: Any) -> None:
         if self._bridge_filler_handle is done_handle:
@@ -692,8 +698,29 @@ class Assistant(Agent):
             except Exception:
                 logger.exception("[CALL_END_TOOL] failed to snapshot SIP participants")
 
-            self._debug_log("tool", "call_end.disconnect_scheduled", delay_seconds=2.0)
-            await asyncio.sleep(2.0)
+            max_wait_for_speech_sec = 6.0
+            post_speech_grace_sec = 0.8
+            waited_for_speech_sec = 0.0
+            while (
+                str(self._latest_agent_state).strip().lower().endswith("speaking")
+                and waited_for_speech_sec < max_wait_for_speech_sec
+            ):
+                await asyncio.sleep(0.1)
+                waited_for_speech_sec = round(waited_for_speech_sec + 0.1, 3)
+
+            self._debug_log(
+                "tool",
+                "call_end.speech_wait_completed",
+                waited_seconds=waited_for_speech_sec,
+                final_agent_state=self._latest_agent_state,
+                grace_seconds=post_speech_grace_sec,
+            )
+            self._debug_log(
+                "tool",
+                "call_end.disconnect_scheduled",
+                delay_seconds=post_speech_grace_sec,
+            )
+            await asyncio.sleep(post_speech_grace_sec)
 
             if sip_identities:
                 room_api = getattr(getattr(ctx, "api", None), "room", None)
@@ -951,6 +978,7 @@ async def my_agent(ctx: JobContext):
     def _on_agent_state_changed(ev: Any) -> None:
         old_state = str(getattr(ev, "old_state", ""))
         new_state = str(getattr(ev, "new_state", ""))
+        assistant.note_agent_state(new_state)
         debug_logger.log("agent", "agent_state_changed", old_state=old_state, new_state=new_state)
 
     @session.on("user_input_transcribed")
