@@ -173,6 +173,28 @@ def _realtime_transcription_language(stt_language: str, assistant_language: str)
     return None
 
 
+async def _speak_fixed_text(
+    session: AgentSession,
+    text: str,
+    *,
+    runtime_mode: str,
+    allow_interruptions: bool = True,
+) -> None:
+    if runtime_mode == "openai_realtime_test":
+        handle = session.generate_reply(
+            instructions=(
+                "Speak to the caller now. Keep it short and natural. "
+                f"Say this message faithfully in one turn: {text}"
+            ),
+            allow_interruptions=allow_interruptions,
+            input_modality="text",
+        )
+        await handle
+        return
+
+    await session.say(text, allow_interruptions=allow_interruptions)
+
+
 def _supports_turn_handling() -> bool:
     try:
         return "turn_handling" in inspect.signature(AgentSession).parameters
@@ -523,6 +545,7 @@ class Assistant(Agent):
         session_config: dict[str, Any],
         call_context_text: str,
         *,
+        incoming_runtime_mode: str = "standard",
         bridge_filler_text: str = "",
         debug_logger: Optional[CallDebugLogger] = None,
     ) -> None:
@@ -531,6 +554,7 @@ class Assistant(Agent):
         self._tenant_id = str(session_config["tenant"]["id"])
         self._business_name = str(session_config["config"].get("business_name") or session_config["tenant"].get("display_name") or "the business")
         self._assistant_language = str(session_config["config"].get("assistant_language") or "en").strip().lower() or "en"
+        self._incoming_runtime_mode = _normalize_incoming_runtime_mode(incoming_runtime_mode)
         self._bridge_filler_text = str(bridge_filler_text or "").strip()
         self._bridge_filler_handle: Any = None
         instructions = _build_instructions(session_config, call_context_text)
@@ -711,7 +735,15 @@ class Assistant(Agent):
 
             if session_obj is not None:
                 try:
-                    await asyncio.wait_for(session_obj.say(self._farewell_text()), timeout=6.0)
+                    await asyncio.wait_for(
+                        _speak_fixed_text(
+                            session_obj,
+                            self._farewell_text(),
+                            runtime_mode=self._incoming_runtime_mode,
+                            allow_interruptions=False,
+                        ),
+                        timeout=8.0,
+                    )
                     logger.info("[CALL_END_TOOL] farewell spoken before disconnect")
                 except asyncio.TimeoutError:
                     logger.warning("[CALL_END_TOOL] farewell timed out; disconnecting anyway")
@@ -981,6 +1013,7 @@ async def my_agent(ctx: JobContext):
     assistant = Assistant(
         session_config=session_config,
         call_context_text=call_context_text,
+        incoming_runtime_mode=incoming_runtime_mode,
         bridge_filler_text=bridge_filler_text,
         debug_logger=debug_logger,
     )
@@ -1058,7 +1091,12 @@ async def my_agent(ctx: JobContext):
         asyncio.create_task(_warmup_llm_once())
 
     greeting = str(config.get("greeting") or f"Thanks for calling {config.get('business_name')}. How may we help you today?")
-    await session.say(greeting)
+    await _speak_fixed_text(
+        session,
+        greeting,
+        runtime_mode=incoming_runtime_mode,
+        allow_interruptions=True,
+    )
 
 
 if __name__ == "__main__":
