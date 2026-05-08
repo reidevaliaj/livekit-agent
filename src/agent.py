@@ -56,6 +56,10 @@ ENABLE_LLM_WARMUP = os.getenv("ENABLE_LLM_WARMUP", "false").strip().lower() == "
 LLM_WARMUP_TIMEOUT_SEC = float(os.getenv("LLM_WARMUP_TIMEOUT_SEC", "3.5").strip() or "3.5")
 LLM_WARMUP_MODEL = (os.getenv("LLM_WARMUP_MODEL", "gpt-4.1-nano").strip() or "gpt-4.1-nano")
 DEFAULT_INCOMING_BRIDGE_FILLER_ENABLED = os.getenv("ENABLE_INCOMING_BRIDGE_FILLER", "false").strip().lower() == "true"
+DEFAULT_INCOMING_REALTIME_MODEL = (
+    os.getenv("INCOMING_OPENAI_REALTIME_MODEL", "gpt-realtime-mini").strip()
+    or "gpt-realtime-mini"
+)
 
 PLATFORM_RULES = """
 Rules:
@@ -223,6 +227,7 @@ def _build_debug_runtime_snapshot(
     bridge_filler_text: str,
     turn_detection_model: str,
     incoming_runtime_mode: str,
+    incoming_realtime_model: str,
     incoming_realtime_voice: str,
 ) -> dict[str, Any]:
     return {
@@ -247,6 +252,7 @@ def _build_debug_runtime_snapshot(
         "preemptive_generation": preemptive_generation_enabled,
         "bridge_filler_text": bridge_filler_text,
         "incoming_runtime_mode": incoming_runtime_mode,
+        "incoming_realtime_model": incoming_realtime_model,
         "incoming_realtime_voice": incoming_realtime_voice,
         "meeting_duration_minutes": int(config.get("meeting_duration_minutes") or 30),
         "booking_horizon_days": int(config.get("booking_horizon_days") or 14),
@@ -861,6 +867,10 @@ async def my_agent(ctx: JobContext):
             (config.get("extra_settings") or {}).get("incoming_runtime_mode"),
         )
     )
+    incoming_realtime_model = str(
+        (config.get("extra_settings") or {}).get("openai_realtime_model")
+        or DEFAULT_INCOMING_REALTIME_MODEL
+    ).strip() or DEFAULT_INCOMING_REALTIME_MODEL
     incoming_realtime_voice = str(
         (config.get("extra_settings") or {}).get("openai_realtime_voice") or "marin"
     ).strip() or "marin"
@@ -887,7 +897,7 @@ async def my_agent(ctx: JobContext):
     preemptive_generation_enabled = incoming_runtime_mode == "standard" and not bool(bridge_filler_text)
 
     logger.info(
-        "[SESSION_CONFIG] tenant=%s config_version=%s runtime_mode=%s language=%s stt_language=%s llm_model=%s tts_speed=%s min_endpointing_delay=%.2f max_endpointing_delay=%.2f interruption_mode=%s interruption_min_duration=%.2f interruption_min_words=%s false_interruption_timeout=%s turn_detector=%s preemptive_generation=%s bridge_filler=%s realtime_voice=%s",
+        "[SESSION_CONFIG] tenant=%s config_version=%s runtime_mode=%s language=%s stt_language=%s llm_model=%s tts_speed=%s min_endpointing_delay=%.2f max_endpointing_delay=%.2f interruption_mode=%s interruption_min_duration=%.2f interruption_min_words=%s false_interruption_timeout=%s turn_detector=%s preemptive_generation=%s bridge_filler=%s realtime_model=%s realtime_voice=%s",
         tenant.get("slug"),
         config.get("version"),
         incoming_runtime_mode,
@@ -904,9 +914,10 @@ async def my_agent(ctx: JobContext):
         turn_detection_model,
         preemptive_generation_enabled,
         bridge_filler_text or "(disabled)",
+        incoming_realtime_model,
         incoming_realtime_voice,
     )
-    debug_logger.log("call", "session_started", room_name=ctx.room.name, tenant_slug=tenant.get("slug"), config_version=config.get("version"), incoming_runtime_mode=incoming_runtime_mode, business_timezone=business_timezone, assistant_language=assistant_language, stt_language=stt_language, llm_model=llm_model, tts_voice=tts_voice, tts_speed=tts_speed, min_endpointing_delay=min_endpointing_delay, max_endpointing_delay=max_endpointing_delay, interruption_mode=interruption_mode, interruption_min_duration=interruption_min_duration, interruption_min_words=interruption_min_words, false_interruption_timeout=false_interruption_timeout)
+    debug_logger.log("call", "session_started", room_name=ctx.room.name, tenant_slug=tenant.get("slug"), config_version=config.get("version"), incoming_runtime_mode=incoming_runtime_mode, incoming_realtime_model=incoming_realtime_model, business_timezone=business_timezone, assistant_language=assistant_language, stt_language=stt_language, llm_model=llm_model, tts_voice=tts_voice, tts_speed=tts_speed, min_endpointing_delay=min_endpointing_delay, max_endpointing_delay=max_endpointing_delay, interruption_mode=interruption_mode, interruption_min_duration=interruption_min_duration, interruption_min_words=interruption_min_words, false_interruption_timeout=false_interruption_timeout)
     debug_logger.log(
         "config",
         "runtime_snapshot",
@@ -930,6 +941,7 @@ async def my_agent(ctx: JobContext):
             bridge_filler_text=bridge_filler_text,
             turn_detection_model=turn_detection_model,
             incoming_runtime_mode=incoming_runtime_mode,
+            incoming_realtime_model=incoming_realtime_model,
             incoming_realtime_voice=incoming_realtime_voice,
         ),
     )
@@ -952,7 +964,7 @@ async def my_agent(ctx: JobContext):
 
         session_kwargs = {
             "llm": openai.realtime.RealtimeModel(
-                model="gpt-realtime",
+                model=incoming_realtime_model,
                 voice=incoming_realtime_voice,
                 input_audio_transcription=InputAudioTranscription(**realtime_transcription_kwargs),
                 input_audio_noise_reduction="near_field",
