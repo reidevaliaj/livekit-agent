@@ -23,6 +23,7 @@ from livekit.agents import (
     get_job_context,
     room_io,
 )
+from openai.types.beta.realtime.session import InputAudioTranscription, TurnDetection
 from livekit.plugins import cartesia, deepgram, noise_cancellation, openai, silero
 from livekit.plugins.turn_detector.multilingual import MultilingualModel
 from livekit.agents.voice.speech_handle import SpeechHandle
@@ -88,6 +89,8 @@ BRIDGE_FILLER_BY_LANGUAGE = {
 }
 SUPPORTED_STT_LANGUAGES = {"en", "it", "de", "multi"}
 SUPPORTED_INTERRUPTION_MODES = {"adaptive", "vad"}
+SUPPORTED_INCOMING_RUNTIME_MODES = {"standard", "openai_realtime_test"}
+SUPPORTED_REALTIME_TRANSCRIPTION_LANGUAGES = {"en", "it", "de"}
 
 
 def _normalize_tts_speed(value: Any) -> float:
@@ -157,6 +160,19 @@ def _normalize_endpointing_window(min_value: Any, max_value: Any) -> tuple[float
     return minimum, maximum
 
 
+def _normalize_incoming_runtime_mode(value: Any) -> str:
+    candidate = str(value or "standard").strip().lower()
+    return candidate if candidate in SUPPORTED_INCOMING_RUNTIME_MODES else "standard"
+
+
+def _realtime_transcription_language(stt_language: str, assistant_language: str) -> str | None:
+    if stt_language in SUPPORTED_REALTIME_TRANSCRIPTION_LANGUAGES:
+        return stt_language
+    if assistant_language in SUPPORTED_REALTIME_TRANSCRIPTION_LANGUAGES:
+        return assistant_language
+    return None
+
+
 def _supports_turn_handling() -> bool:
     try:
         return "turn_handling" in inspect.signature(AgentSession).parameters
@@ -183,6 +199,9 @@ def _build_debug_runtime_snapshot(
     supports_turn_handling: bool,
     preemptive_generation_enabled: bool,
     bridge_filler_text: str,
+    turn_detection_model: str,
+    incoming_runtime_mode: str,
+    incoming_realtime_voice: str,
 ) -> dict[str, Any]:
     return {
         "tenant_slug": tenant.get("slug"),
@@ -194,7 +213,7 @@ def _build_debug_runtime_snapshot(
         "llm_model": llm_model,
         "tts_voice": tts_voice,
         "tts_speed": tts_speed,
-        "turn_detection_model": "MultilingualModel",
+        "turn_detection_model": turn_detection_model,
         "supports_turn_handling": supports_turn_handling,
         "min_endpointing_delay": min_endpointing_delay,
         "max_endpointing_delay": max_endpointing_delay,
@@ -205,6 +224,8 @@ def _build_debug_runtime_snapshot(
         "resume_false_interruption": RESUME_FALSE_INTERRUPTION,
         "preemptive_generation": preemptive_generation_enabled,
         "bridge_filler_text": bridge_filler_text,
+        "incoming_runtime_mode": incoming_runtime_mode,
+        "incoming_realtime_voice": incoming_realtime_voice,
         "meeting_duration_minutes": int(config.get("meeting_duration_minutes") or 30),
         "booking_horizon_days": int(config.get("booking_horizon_days") or 14),
         "enabled_tools": dict(config.get("enabled_tools") or {}),
@@ -802,24 +823,42 @@ async def my_agent(ctx: JobContext):
     false_interruption_timeout = _normalize_false_interruption_timeout(None)
     supports_turn_handling = _supports_turn_handling()
     call_context_text = _build_call_context_text(session_config)
-    incoming_bridge_filler_enabled = bool(
+    incoming_runtime_mode = _normalize_incoming_runtime_mode(
         config.get(
-            "incoming_bridge_filler_enabled",
-            (config.get("extra_settings") or {}).get(
+            "incoming_runtime_mode",
+            (config.get("extra_settings") or {}).get("incoming_runtime_mode"),
+        )
+    )
+    incoming_realtime_voice = str(
+        (config.get("extra_settings") or {}).get("openai_realtime_voice") or "marin"
+    ).strip() or "marin"
+    turn_detection_model = (
+        "OpenAI Realtime Semantic VAD"
+        if incoming_runtime_mode == "openai_realtime_test"
+        else "MultilingualModel"
+    )
+    incoming_bridge_filler_enabled = (
+        incoming_runtime_mode == "standard"
+        and bool(
+            config.get(
                 "incoming_bridge_filler_enabled",
-                DEFAULT_INCOMING_BRIDGE_FILLER_ENABLED,
-            ),
+                (config.get("extra_settings") or {}).get(
+                    "incoming_bridge_filler_enabled",
+                    DEFAULT_INCOMING_BRIDGE_FILLER_ENABLED,
+                ),
+            )
         )
     )
     bridge_filler_text = ""
     if incoming_bridge_filler_enabled:
         bridge_filler_text = str(BRIDGE_FILLER_BY_LANGUAGE.get(assistant_language, "") or "").strip()
-    preemptive_generation_enabled = not bool(bridge_filler_text)
+    preemptive_generation_enabled = incoming_runtime_mode == "standard" and not bool(bridge_filler_text)
 
     logger.info(
-        "[SESSION_CONFIG] tenant=%s config_version=%s language=%s stt_language=%s llm_model=%s tts_speed=%s min_endpointing_delay=%.2f max_endpointing_delay=%.2f interruption_mode=%s interruption_min_duration=%.2f interruption_min_words=%s false_interruption_timeout=%s turn_detector=MultilingualModel preemptive_generation=%s bridge_filler=%s",
+        "[SESSION_CONFIG] tenant=%s config_version=%s runtime_mode=%s language=%s stt_language=%s llm_model=%s tts_speed=%s min_endpointing_delay=%.2f max_endpointing_delay=%.2f interruption_mode=%s interruption_min_duration=%.2f interruption_min_words=%s false_interruption_timeout=%s turn_detector=%s preemptive_generation=%s bridge_filler=%s realtime_voice=%s",
         tenant.get("slug"),
         config.get("version"),
+        incoming_runtime_mode,
         assistant_language,
         stt_language,
         llm_model,
@@ -830,10 +869,12 @@ async def my_agent(ctx: JobContext):
         interruption_min_duration,
         interruption_min_words,
         false_interruption_timeout,
+        turn_detection_model,
         preemptive_generation_enabled,
         bridge_filler_text or "(disabled)",
+        incoming_realtime_voice,
     )
-    debug_logger.log("call", "session_started", room_name=ctx.room.name, tenant_slug=tenant.get("slug"), config_version=config.get("version"), business_timezone=business_timezone, assistant_language=assistant_language, stt_language=stt_language, llm_model=llm_model, tts_voice=tts_voice, tts_speed=tts_speed, min_endpointing_delay=min_endpointing_delay, max_endpointing_delay=max_endpointing_delay, interruption_mode=interruption_mode, interruption_min_duration=interruption_min_duration, interruption_min_words=interruption_min_words, false_interruption_timeout=false_interruption_timeout)
+    debug_logger.log("call", "session_started", room_name=ctx.room.name, tenant_slug=tenant.get("slug"), config_version=config.get("version"), incoming_runtime_mode=incoming_runtime_mode, business_timezone=business_timezone, assistant_language=assistant_language, stt_language=stt_language, llm_model=llm_model, tts_voice=tts_voice, tts_speed=tts_speed, min_endpointing_delay=min_endpointing_delay, max_endpointing_delay=max_endpointing_delay, interruption_mode=interruption_mode, interruption_min_duration=interruption_min_duration, interruption_min_words=interruption_min_words, false_interruption_timeout=false_interruption_timeout)
     debug_logger.log(
         "config",
         "runtime_snapshot",
@@ -855,6 +896,9 @@ async def my_agent(ctx: JobContext):
             supports_turn_handling=supports_turn_handling,
             preemptive_generation_enabled=preemptive_generation_enabled,
             bridge_filler_text=bridge_filler_text,
+            turn_detection_model=turn_detection_model,
+            incoming_runtime_mode=incoming_runtime_mode,
+            incoming_realtime_voice=incoming_realtime_voice,
         ),
     )
     if bridge_filler_text:
@@ -865,42 +909,73 @@ async def my_agent(ctx: JobContext):
             preemptive_generation=preemptive_generation_enabled,
         )
 
-    session_kwargs: Dict[str, Any] = {
-        "stt": deepgram.STT(model="nova-3", language=stt_language),
-        "llm": openai.LLM(model=llm_model),
-        "tts": cartesia.TTS(model="sonic-3", voice=tts_voice, language=assistant_language, speed=tts_speed),
-        "vad": ctx.proc.userdata["vad"],
-    }
-    if supports_turn_handling:
-        session_kwargs["turn_handling"] = {
-            "turn_detection": MultilingualModel(),
-            "endpointing": {
-                "min_delay": min_endpointing_delay,
-                "max_delay": max_endpointing_delay,
-            },
-            "interruption": {
-                "mode": interruption_mode,
-                "min_duration": interruption_min_duration,
-                "min_words": interruption_min_words,
-                "resume_false_interruption": RESUME_FALSE_INTERRUPTION,
-                "false_interruption_timeout": false_interruption_timeout,
-            },
-            "preemptive_generation": {
-                "enabled": preemptive_generation_enabled,
-            },
+    session_kwargs: Dict[str, Any]
+    if incoming_runtime_mode == "openai_realtime_test":
+        realtime_transcription_kwargs: dict[str, Any] = {
+            "model": "gpt-4o-mini-transcribe",
+        }
+        realtime_language = _realtime_transcription_language(stt_language, assistant_language)
+        if realtime_language:
+            realtime_transcription_kwargs["language"] = realtime_language
+
+        session_kwargs = {
+            "llm": openai.realtime.RealtimeModel(
+                model="gpt-realtime",
+                voice=incoming_realtime_voice,
+                input_audio_transcription=InputAudioTranscription(**realtime_transcription_kwargs),
+                input_audio_noise_reduction="near_field",
+                turn_detection=TurnDetection(
+                    type="semantic_vad",
+                    eagerness="high",
+                    create_response=True,
+                    interrupt_response=True,
+                ),
+            ),
+            "allow_interruptions": True,
+            "discard_audio_if_uninterruptible": True,
+            "min_interruption_duration": interruption_min_duration,
+            "min_interruption_words": interruption_min_words,
+            "false_interruption_timeout": false_interruption_timeout,
+            "resume_false_interruption": RESUME_FALSE_INTERRUPTION,
+            "preemptive_generation": False,
         }
     else:
-        if interruption_mode == "adaptive":
-            logger.warning("[SESSION_CONFIG] adaptive interruption requested but current SDK does not support turn_handling; falling back to legacy interruption handling")
-        session_kwargs.update(
-            turn_detection=MultilingualModel(),
-            min_endpointing_delay=min_endpointing_delay,
-            max_endpointing_delay=max_endpointing_delay,
-            min_interruption_duration=interruption_min_duration,
-            false_interruption_timeout=false_interruption_timeout,
-            resume_false_interruption=RESUME_FALSE_INTERRUPTION,
-            preemptive_generation=preemptive_generation_enabled,
-        )
+        session_kwargs = {
+            "stt": deepgram.STT(model="nova-3", language=stt_language),
+            "llm": openai.LLM(model=llm_model),
+            "tts": cartesia.TTS(model="sonic-3", voice=tts_voice, language=assistant_language, speed=tts_speed),
+            "vad": ctx.proc.userdata["vad"],
+        }
+        if supports_turn_handling:
+            session_kwargs["turn_handling"] = {
+                "turn_detection": MultilingualModel(),
+                "endpointing": {
+                    "min_delay": min_endpointing_delay,
+                    "max_delay": max_endpointing_delay,
+                },
+                "interruption": {
+                    "mode": interruption_mode,
+                    "min_duration": interruption_min_duration,
+                    "min_words": interruption_min_words,
+                    "resume_false_interruption": RESUME_FALSE_INTERRUPTION,
+                    "false_interruption_timeout": false_interruption_timeout,
+                },
+                "preemptive_generation": {
+                    "enabled": preemptive_generation_enabled,
+                },
+            }
+        else:
+            if interruption_mode == "adaptive":
+                logger.warning("[SESSION_CONFIG] adaptive interruption requested but current SDK does not support turn_handling; falling back to legacy interruption handling")
+            session_kwargs.update(
+                turn_detection=MultilingualModel(),
+                min_endpointing_delay=min_endpointing_delay,
+                max_endpointing_delay=max_endpointing_delay,
+                min_interruption_duration=interruption_min_duration,
+                false_interruption_timeout=false_interruption_timeout,
+                resume_false_interruption=RESUME_FALSE_INTERRUPTION,
+                preemptive_generation=preemptive_generation_enabled,
+            )
 
     session = AgentSession(**session_kwargs)
     assistant = Assistant(
