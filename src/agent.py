@@ -62,7 +62,7 @@ DEFAULT_INCOMING_REALTIME_MODEL = (
     or "gpt-realtime-mini"
 )
 
-PLATFORM_RULES = """
+DEFAULT_TENANT_RULES = """
 Rules:
 - Speak in a warm, business-professional tone.
 - Keep responses short and phone-friendly.
@@ -429,7 +429,7 @@ def _lookup_attr(attrs: dict[str, str], *candidates: str) -> str:
 def _fallback_session_config(room_name: str, caller_id: str) -> dict[str, Any]:
     return {
         "tenant": {"id": DEFAULT_TENANT_ID, "slug": DEFAULT_TENANT_ID, "display_name": "Code Studio", "status": "active", "notes": "Legacy fallback session config"},
-        "config": {"version": 1, "business_name": "Code Studio", "assistant_language": "en", "assistant_language_label": "English", "stt_language": "en", "timezone": DEFAULT_BUSINESS_TIMEZONE, "greeting": "Thanks for calling Code Studio. How may we help you today?", "tenant_prompt": "You are the receptionist for Code Studio. Help callers understand the business, answer with the configured services, and collect accurate lead details.", "services": ["Web Design", "WordPress, TYPO3, Shopify", "Headless CMS", "Web applications", "AI integration and agents creation", "SEO"], "faq_notes": "", "prompt_appendix": "", "business_hours": "09:00-17:00", "business_days": "1,2,3,4,5", "meeting_duration_minutes": 30, "enabled_tools": {"email_summary": True, "meeting_creation": True, "case_creation": True, "calendar_lookup": True, "zoom_meetings": True}, "llm_model": DEFAULT_LLM_MODEL, "min_endpointing_delay": 0.3, "max_endpointing_delay": 1.2, "tts_voice": DEFAULT_TTS_VOICE, "tts_speed": DEFAULT_TTS_SPEED, "owner_name": "Rey", "owner_email": "info@code-studio.eu", "reply_to_email": "Rej Aliaj <info@code-studio.eu>", "from_email": "Code Studio <noreply@code-studio.eu>", "notification_targets": ["info@code-studio.eu"], "extra_settings": {"meeting_owner_email": "aliajrei@gmail.com"}},
+        "config": {"version": 1, "business_name": "Code Studio", "assistant_language": "en", "assistant_language_label": "English", "stt_language": "en", "timezone": DEFAULT_BUSINESS_TIMEZONE, "greeting": "Thanks for calling Code Studio. How may we help you today?", "tenant_prompt": "You are the receptionist for Code Studio. Help callers understand the business, answer with the configured services, and collect accurate lead details.", "services": ["Web Design", "WordPress, TYPO3, Shopify", "Headless CMS", "Web applications", "AI integration and agents creation", "SEO"], "faq_notes": "", "prompt_appendix": DEFAULT_TENANT_RULES, "business_hours": "09:00-17:00", "business_days": "1,2,3,4,5", "meeting_duration_minutes": 30, "enabled_tools": {"email_summary": True, "meeting_creation": True, "case_creation": True, "calendar_lookup": True, "zoom_meetings": True}, "llm_model": DEFAULT_LLM_MODEL, "min_endpointing_delay": 0.3, "max_endpointing_delay": 1.2, "tts_voice": DEFAULT_TTS_VOICE, "tts_speed": DEFAULT_TTS_SPEED, "owner_name": "Rey", "owner_email": "info@code-studio.eu", "reply_to_email": "Rej Aliaj <info@code-studio.eu>", "from_email": "Code Studio <noreply@code-studio.eu>", "notification_targets": ["info@code-studio.eu"], "extra_settings": {"meeting_owner_email": "aliajrei@gmail.com"}},
         "resolved_at": datetime.now(timezone.utc).isoformat(),
         "room_name": room_name,
         "caller_id": caller_id,
@@ -480,12 +480,13 @@ def _build_instructions(session_config: dict[str, Any], call_context_text: str) 
     tenant_prompt = str(config.get("tenant_prompt") or "").strip()
     services = config.get("services") or []
     faq_notes = str(config.get("faq_notes") or "").strip()
-    prompt_appendix = str(config.get("prompt_appendix") or "").strip()
+    prompt_appendix = str(config.get("prompt_appendix") or DEFAULT_TENANT_RULES).strip() or DEFAULT_TENANT_RULES
     extra_settings = config.get("extra_settings") or {}
     meeting_owner_email = extra_settings.get("meeting_owner_email") or config.get("owner_email") or ""
 
     sections = [
-        PLATFORM_RULES,
+        "Tenant rules (highest priority):",
+        prompt_appendix,
         f"Tenant business name: {business_name}",
         f"Tenant slug: {tenant.get('slug')}",
         f"Configured assistant language: {assistant_language_label} ({assistant_language})",
@@ -505,8 +506,6 @@ def _build_instructions(session_config: dict[str, Any], call_context_text: str) 
         sections.extend(["Mandatory tenant prompt:", tenant_prompt])
     if faq_notes:
         sections.extend(["Business notes:", faq_notes])
-    if prompt_appendix:
-        sections.extend(["Tenant prompt appendix:", prompt_appendix])
     sections.extend(["Call context:", call_context_text])
     return "\n\n".join(section for section in sections if section)
 
