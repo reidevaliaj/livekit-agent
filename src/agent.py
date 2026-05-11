@@ -5,7 +5,7 @@ import logging
 import os
 import time
 from collections.abc import Awaitable, Callable
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 from zoneinfo import ZoneInfo
 
@@ -69,7 +69,7 @@ Rules:
 - If something in the sentence you recive does not make sense or seams not correct ask again kindly.
 - Never offer prices or promise timelines unless the tenant context explicitly says to.
 - Ask only the next needed question.
-- Use check_meeting_slot before confirming any meeting inside the booking horizon.
+- Use check_meeting_slot before confirming any meeting.
 - Only say a meeting is booked or confirmed when check_meeting_slot returns that the slot is available.
 - If check_meeting_slot says the slot is unavailable, busy, outside hours, or live calendar access is unavailable, clearly say the meeting is not booked yet.
 - Never invent availability or time slots.
@@ -225,7 +225,6 @@ def _build_debug_runtime_snapshot(
         "incoming_realtime_model": incoming_realtime_model,
         "incoming_realtime_voice": incoming_realtime_voice,
         "meeting_duration_minutes": int(config.get("meeting_duration_minutes") or 30),
-        "booking_horizon_days": int(config.get("booking_horizon_days") or 14),
         "enabled_tools": dict(config.get("enabled_tools") or {}),
         "tenant_prompt_chars": len(str(config.get("tenant_prompt") or "")),
         "prompt_appendix_chars": len(str(config.get("prompt_appendix") or "")),
@@ -430,7 +429,7 @@ def _lookup_attr(attrs: dict[str, str], *candidates: str) -> str:
 def _fallback_session_config(room_name: str, caller_id: str) -> dict[str, Any]:
     return {
         "tenant": {"id": DEFAULT_TENANT_ID, "slug": DEFAULT_TENANT_ID, "display_name": "Code Studio", "status": "active", "notes": "Legacy fallback session config"},
-        "config": {"version": 1, "business_name": "Code Studio", "assistant_language": "en", "assistant_language_label": "English", "stt_language": "en", "timezone": DEFAULT_BUSINESS_TIMEZONE, "greeting": "Thanks for calling Code Studio. How may we help you today?", "tenant_prompt": "You are the receptionist for Code Studio. Help callers understand the business, answer with the configured services, and collect accurate lead details.", "services": ["Web Design", "WordPress, TYPO3, Shopify", "Headless CMS", "Web applications", "AI integration and agents creation", "SEO"], "faq_notes": "", "prompt_appendix": "", "business_hours": "09:00-17:00", "business_days": "1,2,3,4,5", "meeting_duration_minutes": 30, "booking_horizon_days": 14, "enabled_tools": {"email_summary": True, "meeting_creation": True, "case_creation": True, "calendar_lookup": True, "zoom_meetings": True}, "llm_model": DEFAULT_LLM_MODEL, "min_endpointing_delay": 0.3, "max_endpointing_delay": 1.2, "tts_voice": DEFAULT_TTS_VOICE, "tts_speed": DEFAULT_TTS_SPEED, "owner_name": "Rey", "owner_email": "info@code-studio.eu", "reply_to_email": "Rej Aliaj <info@code-studio.eu>", "from_email": "Code Studio <noreply@code-studio.eu>", "notification_targets": ["info@code-studio.eu"], "extra_settings": {"meeting_owner_email": "aliajrei@gmail.com"}},
+        "config": {"version": 1, "business_name": "Code Studio", "assistant_language": "en", "assistant_language_label": "English", "stt_language": "en", "timezone": DEFAULT_BUSINESS_TIMEZONE, "greeting": "Thanks for calling Code Studio. How may we help you today?", "tenant_prompt": "You are the receptionist for Code Studio. Help callers understand the business, answer with the configured services, and collect accurate lead details.", "services": ["Web Design", "WordPress, TYPO3, Shopify", "Headless CMS", "Web applications", "AI integration and agents creation", "SEO"], "faq_notes": "", "prompt_appendix": "", "business_hours": "09:00-17:00", "business_days": "1,2,3,4,5", "meeting_duration_minutes": 30, "enabled_tools": {"email_summary": True, "meeting_creation": True, "case_creation": True, "calendar_lookup": True, "zoom_meetings": True}, "llm_model": DEFAULT_LLM_MODEL, "min_endpointing_delay": 0.3, "max_endpointing_delay": 1.2, "tts_voice": DEFAULT_TTS_VOICE, "tts_speed": DEFAULT_TTS_SPEED, "owner_name": "Rey", "owner_email": "info@code-studio.eu", "reply_to_email": "Rej Aliaj <info@code-studio.eu>", "from_email": "Code Studio <noreply@code-studio.eu>", "notification_targets": ["info@code-studio.eu"], "extra_settings": {"meeting_owner_email": "aliajrei@gmail.com"}},
         "resolved_at": datetime.now(timezone.utc).isoformat(),
         "room_name": room_name,
         "caller_id": caller_id,
@@ -465,11 +464,9 @@ def _build_call_context_text(session_config: dict[str, Any]) -> str:
     business_timezone = str(config.get("timezone") or DEFAULT_BUSINESS_TIMEZONE)
     now_utc = datetime.now(timezone.utc)
     now_local = now_utc.astimezone(ZoneInfo(business_timezone))
-    horizon_end = now_local + timedelta(days=int(config.get("booking_horizon_days") or 14))
     return (
         f"Current UTC time: {now_utc.isoformat()}\n"
-        f"Current business local time ({business_timezone}): {now_local.isoformat()}\n"
-        f"Meeting booking horizon ends at ({business_timezone}): {horizon_end.isoformat()}"
+        f"Current business local time ({business_timezone}): {now_local.isoformat()}"
     )
 
 
@@ -495,7 +492,6 @@ def _build_instructions(session_config: dict[str, Any], call_context_text: str) 
         f"Business timezone: {config.get('timezone')}",
         f"Business hours: {config.get('business_hours')} on weekdays {config.get('business_days')}",
         f"Meeting duration: {config.get('meeting_duration_minutes')} minutes",
-        f"Booking horizon: {config.get('booking_horizon_days')} days",
         (
             f"You must speak in {assistant_language_label} for greetings, questions, confirmations, "
             f"meeting scheduling, and call wrap-up unless the tenant prompt explicitly requires otherwise."
@@ -636,6 +632,16 @@ class Assistant(Agent):
                 self._debug_log("tool", "check_meeting_slot.result", result=result_text)
                 return result_text
             if status in ("busy", "outside_hours"):
+                next_slot = data.get("next_slot", {}) if isinstance(data, dict) else {}
+                spoken_next = _format_slot_for_voice(next_slot) if isinstance(next_slot, dict) else ""
+                if spoken_next:
+                    result_text = (
+                        "NOT AVAILABLE. Do not confirm the requested slot. Offer this next available slot: "
+                        if status == "busy"
+                        else "OUTSIDE BUSINESS HOURS. Do not confirm the requested slot. Offer this next available slot: "
+                    ) + spoken_next
+                    self._debug_log("tool", "check_meeting_slot.result", result=result_text)
+                    return result_text
                 next_slots = data.get("next_slots", []) if isinstance(data, dict) else []
                 lines: list[str] = []
                 for idx, slot in enumerate(next_slots[:3], start=1):
@@ -652,10 +658,6 @@ class Assistant(Agent):
                     self._debug_log("tool", "check_meeting_slot.result", result=result_text)
                     return result_text
                 result_text = "NOT AVAILABLE. Do not confirm the requested slot. Ask for another time in the booking window."
-                self._debug_log("tool", "check_meeting_slot.result", result=result_text)
-                return result_text
-            if status == "outside_horizon":
-                result_text = "OUTSIDE HORIZON. Do not confirm any meeting. Explain that the team will handle this request after the call."
                 self._debug_log("tool", "check_meeting_slot.result", result=result_text)
                 return result_text
             if status == "unavailable":
