@@ -53,9 +53,26 @@ RESUME_FALSE_INTERRUPTION = os.getenv("RESUME_FALSE_INTERRUPTION", "true").strip
 INTERRUPTION_MIN_WORDS = int((os.getenv("INTERRUPTION_MIN_WORDS", "3") or "3").strip() or "3")
 AGENT_NUM_IDLE_PROCESSES = int(os.getenv("AGENT_NUM_IDLE_PROCESSES", "1").strip() or "1")
 AGENT_LOAD_THRESHOLD = float(os.getenv("AGENT_LOAD_THRESHOLD", "0.95").strip() or "0.95")
-ENABLE_LLM_WARMUP = os.getenv("ENABLE_LLM_WARMUP", "false").strip().lower() == "true"
-LLM_WARMUP_TIMEOUT_SEC = float(os.getenv("LLM_WARMUP_TIMEOUT_SEC", "3.5").strip() or "3.5")
-LLM_WARMUP_MODEL = (os.getenv("LLM_WARMUP_MODEL", "gpt-4.1-nano").strip() or "gpt-4.1-nano")
+INCOMING_ENABLE_LLM_WARMUP = (
+    os.getenv("INCOMING_ENABLE_LLM_WARMUP", os.getenv("ENABLE_LLM_WARMUP", "false"))
+    .strip()
+    .lower()
+    == "true"
+)
+INCOMING_LLM_WARMUP_TIMEOUT_SEC = float(
+    (
+        os.getenv(
+            "INCOMING_LLM_WARMUP_TIMEOUT_SEC",
+            os.getenv("LLM_WARMUP_TIMEOUT_SEC", "3.5"),
+        )
+        or "3.5"
+    ).strip()
+    or "3.5"
+)
+INCOMING_LLM_WARMUP_MODEL = (
+    os.getenv("INCOMING_LLM_WARMUP_MODEL", os.getenv("LLM_WARMUP_MODEL", "gpt-4.1-nano")).strip()
+    or "gpt-4.1-nano"
+)
 DEFAULT_INCOMING_BRIDGE_FILLER_ENABLED = os.getenv("ENABLE_INCOMING_BRIDGE_FILLER", "false").strip().lower() == "true"
 DEFAULT_INCOMING_REALTIME_MODEL = (
     os.getenv("INCOMING_OPENAI_REALTIME_MODEL", "gpt-realtime-mini").strip()
@@ -199,6 +216,8 @@ def _build_debug_runtime_snapshot(
     incoming_runtime_mode: str,
     incoming_realtime_model: str,
     incoming_realtime_voice: str,
+    incoming_warmup_enabled: bool,
+    incoming_warmup_model: str,
 ) -> dict[str, Any]:
     return {
         "tenant_slug": tenant.get("slug"),
@@ -224,6 +243,8 @@ def _build_debug_runtime_snapshot(
         "incoming_runtime_mode": incoming_runtime_mode,
         "incoming_realtime_model": incoming_realtime_model,
         "incoming_realtime_voice": incoming_realtime_voice,
+        "incoming_warmup_enabled": incoming_warmup_enabled,
+        "incoming_warmup_model": incoming_warmup_model,
         "meeting_duration_minutes": int(config.get("meeting_duration_minutes") or 30),
         "enabled_tools": dict(config.get("enabled_tools") or {}),
         "tenant_prompt_chars": len(str(config.get("tenant_prompt") or "")),
@@ -311,29 +332,37 @@ def _event_text_payload(value: Any) -> str:
 
 
 async def _warmup_llm_once() -> None:
-    if not ENABLE_LLM_WARMUP:
+    if not INCOMING_ENABLE_LLM_WARMUP:
         return
     api_key = (os.getenv("OPENAI_API_KEY") or "").strip()
     if not api_key:
-        logger.warning("[WARMUP] skipped: OPENAI_API_KEY not set")
+        logger.warning("[INCOMING_WARMUP] skipped: OPENAI_API_KEY not set")
         return
 
     payload = {
-        "model": LLM_WARMUP_MODEL,
+        "model": INCOMING_LLM_WARMUP_MODEL,
         "messages": [{"role": "system", "content": "Respond with exactly: ok"}],
         "max_completion_tokens": 1,
         "temperature": 0,
     }
     headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
-    timeout = httpx.Timeout(LLM_WARMUP_TIMEOUT_SEC, connect=2.0)
+    timeout = httpx.Timeout(INCOMING_LLM_WARMUP_TIMEOUT_SEC, connect=2.0)
     started = time.monotonic()
     try:
         async with httpx.AsyncClient(timeout=timeout) as client:
             response = await client.post("https://api.openai.com/v1/chat/completions", json=payload, headers=headers)
             response.raise_for_status()
-        logger.info("[WARMUP] LLM warmup done model=%s elapsed=%.3fs", LLM_WARMUP_MODEL, time.monotonic() - started)
+        logger.info(
+            "[INCOMING_WARMUP] done model=%s elapsed=%.3fs",
+            INCOMING_LLM_WARMUP_MODEL,
+            time.monotonic() - started,
+        )
     except Exception:
-        logger.exception("[WARMUP] LLM warmup failed model=%s timeout=%.2fs", LLM_WARMUP_MODEL, LLM_WARMUP_TIMEOUT_SEC)
+        logger.exception(
+            "[INCOMING_WARMUP] failed model=%s timeout=%.2fs",
+            INCOMING_LLM_WARMUP_MODEL,
+            INCOMING_LLM_WARMUP_TIMEOUT_SEC,
+        )
 
 
 def _history_messages(session: AgentSession) -> list[Any]:
@@ -804,6 +833,8 @@ async def my_agent(ctx: JobContext):
     debug_logger = CallDebugLogger()
 
     await ctx.connect()
+    if INCOMING_ENABLE_LLM_WARMUP:
+        asyncio.create_task(_warmup_llm_once())
     session_config = await _fetch_session_config(ctx)
     config = session_config["config"]
     tenant = session_config["tenant"]
@@ -906,6 +937,8 @@ async def my_agent(ctx: JobContext):
             incoming_runtime_mode=incoming_runtime_mode,
             incoming_realtime_model=incoming_realtime_model,
             incoming_realtime_voice=incoming_realtime_voice,
+            incoming_warmup_enabled=INCOMING_ENABLE_LLM_WARMUP,
+            incoming_warmup_model=INCOMING_LLM_WARMUP_MODEL,
         ),
     )
     if bridge_filler_text:
@@ -1027,9 +1060,6 @@ async def my_agent(ctx: JobContext):
             debug_logger.close(cleanup=False)
 
     ctx.add_shutdown_callback(_send_transcript_on_shutdown)
-
-    if ENABLE_LLM_WARMUP:
-        asyncio.create_task(_warmup_llm_once())
 
     greeting = str(config.get("greeting") or f"Thanks for calling {config.get('business_name')}. How may we help you today?")
     await speak_text_fn(
