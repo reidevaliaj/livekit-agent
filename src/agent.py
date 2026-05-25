@@ -718,6 +718,22 @@ class Assistant(Agent):
             self._debug_log("tool", "call_end.event_payload", payload=payload)
             await _post_json("/events/call-end", payload)
 
+            activity = getattr(self, "_activity", None)
+            session_obj = getattr(activity, "session", None) if activity is not None else None
+            farewell_text = self._farewell_text().strip()
+            if session_obj is not None and farewell_text:
+                try:
+                    self._debug_log("tool", "call_end.farewell_started", text=farewell_text)
+                    await self._speak_text_fn(
+                        session_obj,
+                        farewell_text,
+                        allow_interruptions=False,
+                    )
+                    self._debug_log("tool", "call_end.farewell_finished", text=farewell_text)
+                except Exception as exc:
+                    self._debug_log("tool", "call_end.farewell_failed", text=farewell_text, error=str(exc))
+                    logger.exception("[CALL_END_TOOL] farewell playback failed")
+
             sip_identities: list[str] = []
             try:
                 for participant in room.remote_participants.values():
