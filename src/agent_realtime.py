@@ -36,7 +36,6 @@ def build_realtime_session(
             model=incoming_realtime_model,
             voice=incoming_realtime_voice,
             input_audio_transcription=InputAudioTranscription(**realtime_transcription_kwargs),
-            input_audio_noise_reduction="near_field",
             turn_detection=TurnDetection(
                 type="semantic_vad",
                 eagerness="high",
