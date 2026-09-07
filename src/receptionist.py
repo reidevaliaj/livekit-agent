@@ -47,18 +47,31 @@ and does NOT confirm or save a reservation. Its notes are only the final interna
 It does not make a real booking or contact anyone.
 """
 
+VERBAL_RESERVATION_RULES = """VERBAL HOLIDAY RESERVATIONS: Follow the configured catalogue and availability policy.
+Collect the selected home, check-in and check-out dates, guest count, name and contact if provided.
+Dates are sufficient for a stay. Recap once and confirm the reservation only after the caller agrees.
+Give the verbal confirmation directly; no tool is needed. Never claim that a calendar, CRM, payment,
+email or message action took place. Do not invent a booking reference or request payment details.
+After confirming, ask briefly whether anything else is needed and WAIT for the caller's next turn.
+call_end hangs up; it is not a booking tool. Use it only when the caller declines further help,
+says goodbye or asks to stop. Its notes retain the final internal call summary.
+"""
+
 LEGACY_BOOKING_RULES = {
     "- Only say a meeting is booked or confirmed when check_meeting_slot returns that the slot is available.",
     "- Use check_meeting_slot before confirming any meeting.",
 }
 
 
-def booking_simulation(snapshot: dict, direction: str) -> bool:
-    return (
+def reservation_mode(snapshot: dict, direction: str) -> str:
+    mode = (snapshot["config"].get("extra_settings") or {}).get("booking_mode")
+    if (
         direction == "incoming"
-        and (snapshot["config"].get("extra_settings") or {}).get("booking_mode")
-        == "simulation"
-    )
+        and isinstance(mode, str)
+        and mode in {"simulation", "verbal_reservation"}
+    ):
+        return mode
+    return "calendar"
 
 
 def business_rules(text: str) -> str:
@@ -80,14 +93,18 @@ def booking_key(tenant_id: str, room: str, start_iso: str, duration: int) -> str
 
 def instructions(snapshot: dict, direction: str) -> str:
     config = snapshot["config"]
-    simulation = booking_simulation(snapshot, direction)
+    mode = reservation_mode(snapshot, direction)
     outgoing = snapshot.get("outgoing") or {}
     language = voice_options(snapshot, direction).language
     zone = str(config.get("timezone") or "UTC")
     now = datetime.now(ZoneInfo(zone)).isoformat(timespec="minutes")
     parts = [
         RULES,
-        SIMULATION_BOOKING_RULES if simulation else CALENDAR_BOOKING_RULES,
+        {
+            "simulation": SIMULATION_BOOKING_RULES,
+            "verbal_reservation": VERBAL_RESERVATION_RULES,
+            "calendar": CALENDAR_BOOKING_RULES,
+        }[mode],
         f"Speak {LANGUAGES.get(language, language)}.",
         f"Business: {config['business_name']}. Timezone: {zone}.",
     ]
@@ -116,7 +133,7 @@ def instructions(snapshot: dict, direction: str) -> str:
             "Business notes: " + str(config.get("faq_notes") or ""),
             f"Business hours: {config.get('business_hours', '')}; days: {config.get('business_days', '')}.",
         ]
-        if not simulation:
+        if mode == "calendar":
             parts += [
                 f"Default meeting duration: {config.get('meeting_duration_minutes') or 30} minutes.",
                 f"Escalation contact: {config.get('owner_name') or 'the team'}; {config.get('owner_email') or ''}.",
@@ -138,7 +155,7 @@ class Receptionist(Agent):
         self.finish = finish
         self.tenant_id = str(snapshot["tenant"]["id"])
         self._ending = False
-        self._simulation = booking_simulation(snapshot, direction)
+        self._local_reservations = reservation_mode(snapshot, direction) != "calendar"
         self._enabled = snapshot["config"].get("enabled_tools") or {}
         self._knowledge = {
             str(t.get("name", "")).strip().casefold(): t
@@ -148,14 +165,14 @@ class Receptionist(Agent):
         end_description = (
             "Hang up ONLY when the caller explicitly asks to stop, says goodbye, or declines "
             "further help. This does NOT confirm or save a reservation. Never call it to "
-            "accept booking consent. Confirm the test stay by speaking, ask if anything "
+            "accept booking consent. Confirm the stay by speaking, ask if anything "
             "else is needed, and wait for the caller's next answer before hanging up. "
             "Include collected details in the final internal call summary."
-            if self._simulation
+            if self._local_reservations
             else None
         )
         tools = [function_tool(self.call_end, description=end_description)]
-        if direction == "incoming" and not self._simulation:
+        if direction == "incoming" and not self._local_reservations:
             if self._enabled.get("calendar_lookup", False):
                 tools.append(function_tool(self.check_meeting_slot))
             if self._enabled.get("meeting_creation", False):
@@ -194,7 +211,7 @@ class Receptionist(Agent):
         """Check a timezone-qualified ISO date/time. This does not book or reserve anything."""
         if (
             self.direction != "incoming"
-            or self._simulation
+            or self._local_reservations
             or not self._enabled.get("calendar_lookup", False)
         ):
             return {"status": "unavailable", "booked": False}
@@ -233,7 +250,7 @@ class Receptionist(Agent):
         """Book the exact timezone-qualified slot agreed by the caller. Confirm only booked=true."""
         if (
             self.direction != "incoming"
-            or self._simulation
+            or self._local_reservations
             or not self._enabled.get("meeting_creation", False)
         ):
             return {"status": "unavailable", "booked": False}

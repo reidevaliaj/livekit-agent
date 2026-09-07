@@ -57,6 +57,13 @@ waits for the caller to finish before `call_end` records an internal summary.
 The mode has no effect on outgoing calls; removing it restores ordinary booking
 rules. This mode does not create reservations in any external system.
 
+`booking_mode=verbal_reservation` uses the same isolated tool boundary with
+plain reservation language. The business prompt supplies availability and
+confirmation rules; the model receives no simulation instructions. Calendar,
+CRM, email and payment operations remain unavailable. Use the versioned tenant
+configuration to choose the appropriate wording; external inventory is not
+reserved by this mode.
+
 Session configuration failures terminate the affected call; the worker never
 uses another business as a fallback. Goodbye and SIP cleanup are bounded, even
 when event delivery or provider hangup fails. Final transcripts use the backend's

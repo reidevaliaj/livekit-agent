@@ -79,9 +79,54 @@ def test_holiday_simulation_has_consent_and_test_only_rules_without_meeting_cont
     assert "old-business@example.com" not in prompt
 
 
+def test_verbal_reservation_has_no_demo_language_or_calendar_context(config):
+    config["config"]["extra_settings"]["booking_mode"] = "verbal_reservation"
+    config["config"].update(owner_name="Legacy owner", owner_email="old@example.com")
+    agent, _, _ = make_agent(config)
+    prompt = instructions(config, "incoming")
+    assert "VERBAL HOLIDAY RESERVATIONS" in prompt
+    assert "caller agrees" in prompt
+    assert "WAIT" in prompt
+    assert "no tool is needed" in prompt
+    assert "calendar, CRM, payment, email or message" in " ".join(prompt.split())
+    assert "book_meeting returns" not in prompt
+    assert "Default meeting duration" not in prompt
+    assert "old@example.com" not in prompt
+    model_context = (
+        prompt + " " + " ".join(tool.info.description for tool in agent.tools)
+    ).lower()
+    for forbidden in (
+        "demo",
+        "simulation",
+        "fictional",
+        "test reservation",
+        "test stay",
+        "di prova",
+    ):
+        assert forbidden not in model_context
+
+
+@pytest.mark.asyncio
+async def test_verbal_reservation_cannot_invoke_external_booking(config):
+    config["config"]["extra_settings"]["booking_mode"] = "verbal_reservation"
+    agent, backend, _ = make_agent(config)
+    assert {tool.info.name for tool in agent.tools} == {"call_end"}
+    assert "does NOT confirm or save a reservation" in agent.tools[0].info.description
+    assert (await agent.check_meeting_slot("2026-10-01T10:00:00+02:00"))[
+        "booked"
+    ] is False
+    assert (await agent.book_meeting("2026-10-01T10:00:00+02:00"))["booked"] is False
+    backend.post.assert_not_awaited()
+
+
 @pytest.mark.parametrize(
     ("direction", "mode"),
-    [("incoming", None), ("incoming", "SIMULATION"), ("outgoing", "simulation")],
+    [
+        ("incoming", None),
+        ("incoming", "SIMULATION"),
+        ("outgoing", "simulation"),
+        ("outgoing", "verbal_reservation"),
+    ],
 )
 def test_real_booking_rules_remain_default_and_outgoing_never_uses_demo(
     config, direction, mode
