@@ -87,7 +87,10 @@ class CallDiagnostics:
                 record[key] = {
                     k: v
                     for k, v in value.items()
-                    if k in METRICS and isinstance(v, (int, float)) and math.isfinite(v)
+                    if k in METRICS
+                    and isinstance(v, (int, float))
+                    and math.isfinite(v)
+                    and v >= 0
                 }
             elif value is None or isinstance(value, (bool, int)):
                 record[key] = value

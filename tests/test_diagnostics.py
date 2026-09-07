@@ -32,3 +32,11 @@ def test_numeric_metrics_keep_zero_and_drop_payloads(tmp_path):
     log.close()
     record = json.loads(log.path.read_text().splitlines()[0])
     assert record["metrics"] == {"e2e_latency": 0, "ttft": 0.25}
+
+
+def test_missing_realtime_timing_sentinel_is_not_reported_as_negative_latency(tmp_path):
+    log = CallDiagnostics(tmp_path, "incoming", "tenant", "room")
+    log.emit("per_turn_metrics", metrics={"ttft": -1, "duration": 0, "output_tokens": 20})
+    log.close()
+    record = json.loads(log.path.read_text().splitlines()[0])
+    assert record["metrics"] == {"duration": 0, "output_tokens": 20}

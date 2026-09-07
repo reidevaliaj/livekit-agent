@@ -155,7 +155,9 @@ async def test_teardown_targets_only_linked_sip_participant():
     await disconnect_sip(ctx, "sip-one")
     removed.assert_awaited_once()
     assert removed.await_args.args[0].identity == "sip-one"
-    room.disconnect.assert_awaited_once()
+    # The SDK disconnects the agent room after closing the session and its
+    # transcript/event streams. Only the linked SIP caller is removed here.
+    room.disconnect.assert_not_awaited()
     assert shutdown
 
 
@@ -222,6 +224,7 @@ async def test_final_transcript_retries_identical_event_and_keeps_diagnostic_id(
     runtime.ctx = SimpleNamespace(room=SimpleNamespace(name="room"))
     runtime.participant_identity = "sip-id"
     runtime.session = SimpleNamespace(history=SimpleNamespace(messages=lambda: []))
+    runtime.session.llm = SimpleNamespace(aclose=AsyncMock())
     runtime.log = SimpleNamespace(
         call_id="diag-uuid", emit=lambda *_args, **_kwargs: None, close=lambda: None
     )

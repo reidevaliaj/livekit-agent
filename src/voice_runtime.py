@@ -138,9 +138,8 @@ async def disconnect_sip(ctx, identity: str | None = None):
                         room=ctx.room.name, identity=participant_identity
                     )
                 )
-    with contextlib.suppress(Exception):
-        async with asyncio.timeout(2.0):
-            await ctx.room.disconnect()
+    # JobContext closes the AgentSession and invokes on_session_end before it
+    # disconnects the agent room, so transcript/control streams can drain.
     ctx.shutdown(reason="receptionist finished")
 
 
@@ -210,12 +209,15 @@ class CallRuntime:
             if isinstance(metrics, dict):
                 self.log.emit("per_turn_metrics", metrics=metrics)
 
-        @self.session.llm.on("metrics_collected")
+        # AgentSession forwards metrics from its RealtimeSession; RealtimeModel
+        # is a factory and is not an event emitter.
+        @self.session.on("metrics_collected")
         def realtime_metrics(event):
+            metrics = event.metrics
             self.log.emit(
                 "per_turn_metrics",
                 metrics={
-                    k: getattr(event, k, None)
+                    k: getattr(metrics, k, None)
                     for k in (
                         "ttft",
                         "duration",
@@ -294,10 +296,16 @@ class CallRuntime:
             await self.speak(str(greeting), interruptible=True)
 
     async def speak(self, text: str, *, interruptible: bool):
+        if not interruptible:
+            # This is the terminal farewell only. Disable server turn taking
+            # before requesting non-interruptible speech; normal calls keep VAD.
+            self.session.llm.update_options(turn_detection=None)
         async with asyncio.timeout(30.0 if interruptible else 8.0):
             handle = self.session.generate_reply(
-                instructions=f"Say this brief message faithfully in the configured language: {text}",
-                allow_interruptions=interruptible,
+                instructions=f"Speak exactly this message in the configured language, with no additions: {text}",
+                # Realtime turn taking controls interruption. It is disabled
+                # above for the farewell and remains active for the greeting.
+                allow_interruptions=True,
                 tool_choice="none",
                 input_modality="text",
             )
@@ -492,6 +500,7 @@ class CallRuntime:
                 for task in pending:
                     task.cancel()
             await self.backend.aclose()
+            await self.session.llm.aclose()
             self.log.close()
 
 
