@@ -47,6 +47,16 @@ an event ID. Its stable idempotency key binds tenant, call room, normalized UTC
 slot and duration. Unknown/pending/timeouts never produce a booking confirmation.
 Disabled tools are omitted from the model and checked again at execution.
 
+For an incoming holiday-booking demo, set the tenant's
+`extra_settings.booking_mode` to `simulation` and explicitly disable
+`calendar_lookup`, `meeting_creation`, `zoom_meetings`, `email_summary` and
+`case_creation` in its versioned backend configuration. Supply a fictional
+catalogue and demo availability in the tenant prompt/FAQ. The agent confirms
+only test reservations after caller consent, exposes no calendar tools, and
+waits for the caller to finish before `call_end` records an internal summary.
+The mode has no effect on outgoing calls; removing it restores ordinary booking
+rules. This mode does not create reservations in any external system.
+
 Session configuration failures terminate the affected call; the worker never
 uses another business as a fallback. Goodbye and SIP cleanup are bounded, even
 when event delivery or provider hangup fails. Final transcripts use the backend's

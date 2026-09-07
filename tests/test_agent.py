@@ -54,6 +54,48 @@ def test_known_legacy_booking_instruction_is_removed(config):
     assert "book_meeting returns booked=true with an event_id" in prompt
 
 
+def test_holiday_simulation_has_consent_and_test_only_rules_without_meeting_context(
+    config,
+):
+    config["config"]["extra_settings"]["booking_mode"] = "simulation"
+    config["config"].update(
+        owner_name="Old business owner",
+        owner_email="old-business@example.com",
+        meeting_duration_minutes=45,
+    )
+    prompt = instructions(config, "incoming")
+    assert "SIMULATED HOLIDAY RESERVATIONS" in prompt
+    assert "caller agrees" in prompt
+    assert "test reservation" in prompt
+    assert "check-in and check-out dates" in prompt
+    assert "never claim" in prompt
+    assert "calendar, CRM, payment, email or message" in " ".join(prompt.split())
+    assert "Use only this business's configured facts" in prompt
+    assert "If a tool is unavailable" in prompt
+    assert "Use call_end" in prompt
+    assert "book_meeting returns" not in prompt
+    assert "Default meeting duration" not in prompt
+    assert "Old business owner" not in prompt
+    assert "old-business@example.com" not in prompt
+
+
+@pytest.mark.parametrize(
+    ("direction", "mode"),
+    [("incoming", None), ("incoming", "SIMULATION"), ("outgoing", "simulation")],
+)
+def test_real_booking_rules_remain_default_and_outgoing_never_uses_demo(
+    config, direction, mode
+):
+    config["config"]["extra_settings"]["booking_mode"] = mode
+    prompt = instructions(config, direction)
+    assert "book_meeting returns booked=true with an event_id" in prompt
+    assert (
+        "Before booking, obtain the caller's agreement to an exact date, time and timezone"
+        in prompt
+    )
+    assert "SIMULATED HOLIDAY RESERVATIONS" not in prompt
+
+
 @pytest.mark.asyncio
 async def test_backend_auth_and_connection_reuse():
     seen = []
@@ -142,6 +184,36 @@ async def test_disabled_calendar_rejected_even_if_function_is_called(config):
         tool.info.name not in {"book_meeting", "check_meeting_slot"}
         for tool in agent.tools
     )
+
+
+@pytest.mark.asyncio
+async def test_simulation_blocks_calendar_even_with_stale_enabled_flags(config):
+    config["config"]["extra_settings"]["booking_mode"] = "simulation"
+    agent, backend, _ = make_agent(config)
+    assert {tool.info.name for tool in agent.tools} == {"call_end"}
+    assert "does NOT confirm or save a reservation" in agent.tools[0].info.description
+    availability = await agent.check_meeting_slot("2026-10-01T10:00:00+02:00")
+    booking = await agent.book_meeting("2026-10-01T10:00:00+02:00")
+    assert availability == {"status": "unavailable", "booked": False}
+    assert booking == {"status": "unavailable", "booked": False}
+    backend.post.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_simulated_reservation_details_use_existing_internal_call_record(config):
+    config["config"]["extra_settings"]["booking_mode"] = "simulation"
+    agent, backend, finish = make_agent(config)
+    notes = (
+        "Test reservation: Casa Demo, 10-15 October 2026, two guests; caller agreed."
+    )
+    result = await agent.call_end(
+        call_type="general", topic="Test reservation", notes=notes
+    )
+    backend.post.assert_awaited_once()
+    assert backend.post.await_args.args[0] == "/events/call-end"
+    assert backend.post.await_args.args[1]["notes"] == notes
+    assert result["details_saved"] is True
+    finish.assert_awaited_once()
 
 
 @pytest.mark.asyncio
