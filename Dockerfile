@@ -43,7 +43,7 @@ RUN mkdir -p src
 # --locked ensures we use exact versions from uv.lock for reproducible builds
 # This creates a virtual environment and installs all dependencies
 # Ensure your uv.lock file is checked in for consistency across environments
-RUN uv sync --locked
+RUN uv sync --locked --no-dev
 
 # Copy all remaining application files into the container
 # This includes source code, configuration files, and dependency specifications
@@ -58,12 +58,7 @@ RUN chown -R appuser:appuser /app
 # This improves security by not running as root
 USER appuser
 
-# Pre-download any ML models or files the agent needs
-# This ensures the container is ready to run immediately without downloading
-# dependencies at runtime, which improves startup time and reliability
-RUN uv run src/agent.py download-files
-
 # Run the application using UV
 # UV will activate the virtual environment and run the agent.
 # The "start" command tells the worker to connect to LiveKit and begin waiting for jobs.
-CMD ["uv", "run", "src/agent.py", "start"]
+CMD ["uv", "run", "--locked", "--no-dev", "src/agent.py", "start"]

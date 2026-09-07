@@ -7,6 +7,12 @@ __pycache__
 .idea
 KMS
 .venv
+venv/
+runtime/
+.releases/
+*.log
+*.out
+*.pid
 .vscode
 *.egg-info
 .pytest_cache

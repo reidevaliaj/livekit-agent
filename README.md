@@ -1,142 +1,104 @@
-<a href="https://livekit.io/">
-  <img src="./.github/assets/livekit-mark.png" alt="LiveKit logo" width="100" height="100">
-</a>
+# AI receptionist voice workers
 
-# LiveKit Agents Starter - Python
+Incoming and outgoing calls share one OpenAI Realtime speech engine:
+`gpt-realtime-2.1-mini`, low reasoning effort, semantic VAD with high eagerness,
+and interruptible speech. The backend supplies business context, language and a
+supported OpenAI voice (Marin by default). There are no alternative runtime modes.
+The auxiliary `gpt-4o-mini-transcribe` stream supplies call history; responses do
+not wait for that transcript. No Deepgram, Cartesia, Silero or downloaded turn
+detector models are used.
 
-A complete starter project for building voice AI apps with [LiveKit Agents for Python](https://github.com/livekit/agents) and [LiveKit Cloud](https://cloud.livekit.io/).
+## Setup and run
 
-The starter project includes:
+Use Python 3.12+ and uv. Copy `.env.example` to `.env.local` and supply the existing
+LiveKit/OpenAI credentials plus the backend's dedicated `AGENT_API_TOKEN`.
 
-- A simple voice AI assistant, ready for extension and customization
-- A voice AI pipeline with [models](https://docs.livekit.io/agents/models) from OpenAI, Cartesia, and Deepgram served through LiveKit Cloud
-  - Easily integrate your preferred [LLM](https://docs.livekit.io/agents/models/llm/), [STT](https://docs.livekit.io/agents/models/stt/), and [TTS](https://docs.livekit.io/agents/models/tts/) instead, or swap to a realtime model like the [OpenAI Realtime API](https://docs.livekit.io/agents/models/realtime/openai)
-- Eval suite based on the LiveKit Agents [testing & evaluation framework](https://docs.livekit.io/agents/build/testing/)
-- [LiveKit Turn Detector](https://docs.livekit.io/agents/build/turns/turn-detector/) for contextually-aware speaker detection, with multilingual support
-- [Background voice cancellation](https://docs.livekit.io/home/cloud/noise-cancellation/)
-- Integrated [metrics and logging](https://docs.livekit.io/agents/build/metrics/)
-- A Dockerfile ready for [production deployment](https://docs.livekit.io/agents/ops/deployment/)
-
-This starter app is compatible with any [custom web/mobile frontend](https://docs.livekit.io/agents/start/frontend/) or [SIP-based telephony](https://docs.livekit.io/agents/start/telephony/).
-
-## Coding agents and MCP
-
-This project is designed to work with coding agents like [Cursor](https://www.cursor.com/) and [Claude Code](https://www.anthropic.com/claude-code). 
-
-To get the most out of these tools, install the [LiveKit Docs MCP server](https://docs.livekit.io/mcp).
-
-For Cursor, use this link:
-
-[![Install MCP Server](https://cursor.com/deeplink/mcp-install-light.svg)](https://cursor.com/en-US/install-mcp?name=livekit-docs&config=eyJ1cmwiOiJodHRwczovL2RvY3MubGl2ZWtpdC5pby9tY3AifQ%3D%3D)
-
-For Claude Code, run this command:
-
-```
-claude mcp add --transport http livekit-docs https://docs.livekit.io/mcp
+```sh
+uv sync --locked
+uv run --locked python src/agent.py start
+uv run --locked python src/outgoing_agent.py start
 ```
 
-For Codex CLI, use this command to install the server:
-```
-codex mcp add --url https://docs.livekit.io/mcp livekit-docs
-```
+Run each worker in its own managed process. Incoming dispatch remains `my-agent`;
+outgoing defaults to `outgoing-agent`. Existing SIP identities and Twilio/Telnyx
+backend routing contracts remain supported. LiveKit-first outbound prepares the
+voice session before dialing and requests its opening phrase after answer.
 
-For Gemini CLI, use this command to install the server:
-```
-gemini mcp add --transport http livekit-docs https://docs.livekit.io/mcp
-```
+When deploying into a release directory, set `CALL_DIAGNOSTICS_DIR` to the shared
+application path read by the administration UI, usually
+`/home/rei/apps/livekit-agent/runtime/calls`. Set `FASTAPI_BASE_URL` to the private
+backend address. Authentication uses `X-Agent-Token`, not the legacy internal key.
+Dependency updates must regenerate `uv.lock` and pass the offline suite before a
+new release replaces the running worker. Keep the previous release and its
+environment for rollback; never update a running environment in place.
 
-The project includes a complete [AGENTS.md](AGENTS.md) file for these assistants. You can modify this file  your needs. To learn more about this file, see [https://agents.md](https://agents.md).
+## Modules
 
-## Dev Setup
+* `agent.py` / `outgoing_agent.py`: worker entrypoints and dispatch names.
+* `voice_runtime.py`: shared realtime session, SIP lifecycle, transcript delivery.
+* `receptionist.py`: business instructions, knowledge, availability, booking and end-call tools.
+* `backend_client.py`: pooled authenticated HTTP with whole-operation deadlines.
+* `runtime_config.py`: fixed model and effective language/voice validation.
+* `diagnostics.py`: bounded asynchronous diagnostic writing to unique call files.
 
-Clone the repository and install dependencies to a virtual environment:
+Availability is not a booking. `check_meeting_slot` always reports `booked=false`.
+`book_meeting` confirms only a backend `status=booked`, `ok=true` result containing
+an event ID. Its stable idempotency key binds tenant, call room, normalized UTC
+slot and duration. Unknown/pending/timeouts never produce a booking confirmation.
+Disabled tools are omitted from the model and checked again at execution.
 
-```console
-cd agent-starter-python
-uv sync
-```
+Session configuration failures terminate the affected call; the worker never
+uses another business as a fallback. Goodbye and SIP cleanup are bounded, even
+when event delivery or provider hangup fails. Final transcripts use the backend's
+durable event acceptance endpoint after the voice pipeline drains. A delivery
+failure is visible as `transcript_delivery_failed`; an accepted event means queued,
+not that every downstream action has finished.
 
-Sign up for [LiveKit Cloud](https://cloud.livekit.io/) then set up the environment by copying `.env.example` to `.env.local` and filling in the required keys:
+## Diagnostics
 
-- `LIVEKIT_URL`
-- `LIVEKIT_API_KEY`
-- `LIVEKIT_API_SECRET`
+Each call writes `runtime/calls/<UUID>.jsonl`. The envelope contains:
+`ts`, `elapsed_ms`, `call_id`, `direction` (`incoming`/`outgoing`), `tenant_id`,
+hashed `room_id`, and `event`. Fields are explicitly allowlisted. Caller speech,
+phone numbers, tool arguments/results, and credentials are not diagnostic fields.
+Files use restrictive permissions. The queue is bounded and drops diagnostics
+instead of stalling the voice pipeline when full. Apply normal retention to this
+directory at deployment; files are separated per call and never overwrite another
+active call.
 
-You can load the LiveKit environment automatically using the [LiveKit CLI](https://docs.livekit.io/home/cli/cli-setup):
+| Event | Fields |
+|---|---|
+| `session_config` | model, voice, language, config_version, sdk_version, turn_detection, eagerness, reasoning_effort |
+| `lifecycle` | stage: session_starting, session_ready, dial_started, callee_answered, greeting_requested |
+| `turn_state` | actor, old_state, new_state |
+| `response_timing` | user_stop_to_agent_speaking_ms, measurement=software_state_proxy_not_pstn_audio |
+| `per_turn_metrics` | metrics: numeric SDK latency/token fields only |
+| `tool_completed` | tool_name, duration_ms, outcome |
+| `session_error` / `delivery_error` | error_type, recoverable or stage |
+| `session_ended` | reason, transcript_accepted |
 
-```bash
-lk cloud auth
-lk app env -w -d .env.local
-```
+State gaps and SDK metrics are software measurements. They do not directly
+measure first sound at a telephone receiver. Realtime has no separate text-LLM
+and TTS stage timings. Compare the same metric across like call modes and retain
+telephone recordings from controlled tests when validating perceived latency.
 
-## Run the agent
+Cloud session recording is explicitly disabled by this worker (`record=False`).
+Existing backend call histories still receive transcripts. Provider/account
+retention policies are managed separately.
 
-Before your first run, you must download certain models such as [Silero VAD](https://docs.livekit.io/agents/build/turns/vad/) and the [LiveKit turn detector](https://docs.livekit.io/agents/build/turns/turn-detector/):
+## Offline validation
 
-```console
-uv run python src/agent.py download-files
-```
-
-Next, run this command to speak to your agent directly in your terminal:
-
-```console
-uv run python src/agent.py console
-```
-
-To run the agent for use with a frontend or telephony, use the `dev` command:
-
-```console
-uv run python src/agent.py dev
-```
-
-In production, use the `start` command:
-
-```console
-uv run python src/agent.py start
-```
-
-## Frontend & Telephony
-
-Get started quickly with our pre-built frontend starter apps, or add telephony support:
-
-| Platform | Link | Description |
-|----------|----------|-------------|
-| **Web** | [`livekit-examples/agent-starter-react`](https://github.com/livekit-examples/agent-starter-react) | Web voice AI assistant with React & Next.js |
-| **iOS/macOS** | [`livekit-examples/agent-starter-swift`](https://github.com/livekit-examples/agent-starter-swift) | Native iOS, macOS, and visionOS voice AI assistant |
-| **Flutter** | [`livekit-examples/agent-starter-flutter`](https://github.com/livekit-examples/agent-starter-flutter) | Cross-platform voice AI assistant app |
-| **React Native** | [`livekit-examples/voice-assistant-react-native`](https://github.com/livekit-examples/voice-assistant-react-native) | Native mobile app with React Native & Expo |
-| **Android** | [`livekit-examples/agent-starter-android`](https://github.com/livekit-examples/agent-starter-android) | Native Android app with Kotlin & Jetpack Compose |
-| **Web Embed** | [`livekit-examples/agent-starter-embed`](https://github.com/livekit-examples/agent-starter-embed) | Voice AI widget for any website |
-| **Telephony** | [📚 Documentation](https://docs.livekit.io/agents/start/telephony/) | Add inbound or outbound calling to your agent |
-
-For advanced customization, see the [complete frontend guide](https://docs.livekit.io/agents/start/frontend/).
-
-## Tests and evals
-
-This project includes a complete suite of evals, based on the LiveKit Agents [testing & evaluation framework](https://docs.livekit.io/agents/build/testing/). To run them, use `pytest`.
-
-```console
-uv run pytest
+```sh
+uv run --locked pytest tests -q
+uv run --locked ruff check src tests
+uv run --locked ruff format --check src tests
 ```
 
-## Using this template repo for your own project
+Tests use mocked HTTP/SIP and provider-free SDK construction. They cover deadlines,
+auth, tenant failure, booking truthfulness/idempotency, tool disablement, diagnostic
+privacy, outbound start ordering and teardown failures. They do not make calls or
+paid AI requests and cannot establish real voice quality or production latency.
+Perform a controlled test call and a limited rollout after deployment.
 
-Once you've started your own project based on this repo, you should:
-
-1. **Check in your `uv.lock`**: This file is currently untracked for the template, but you should commit it to your repository for reproducible builds and proper configuration management. (The same applies to `livekit.toml`, if you run your agents in LiveKit Cloud)
-
-2. **Remove the git tracking test**: Delete the "Check files not tracked in git" step from `.github/workflows/tests.yml` since you'll now want this file to be tracked. These are just there for development purposes in the template repo itself.
-
-3. **Add your own repository secrets**: You must [add secrets](https://docs.github.com/en/actions/how-tos/writing-workflows/choosing-what-your-workflow-does/using-secrets-in-github-actions) for `LIVEKIT_URL`, `LIVEKIT_API_KEY`, and `LIVEKIT_API_SECRET` so that the tests can run in CI.
-
-## Deploying to production
-
-This project is production-ready and includes a working `Dockerfile`. To deploy it to LiveKit Cloud or another environment, see the [deploying to production](https://docs.livekit.io/agents/ops/deployment/) guide.
-
-## Self-hosted LiveKit
-
-You can also self-host LiveKit instead of using LiveKit Cloud. See the [self-hosting](https://docs.livekit.io/home/self-hosting/) guide for more information. If you choose to self-host, you'll need to also use [model plugins](https://docs.livekit.io/agents/models/#plugins) instead of LiveKit Inference and will need to remove the [LiveKit Cloud noise cancellation](https://docs.livekit.io/home/cloud/noise-cancellation/) plugin.
-
-## License
-
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+Relevant API references: [OpenAI Realtime plugin](https://docs.livekit.io/agents/models/realtime/plugins/openai/),
+[LiveKit data hooks](https://docs.livekit.io/deploy/observability/data/),
+[turn handling](https://docs.livekit.io/reference/agents/turn-handling-options/).

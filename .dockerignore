@@ -21,6 +21,8 @@ coverage/
 *.log
 *.gz
 *.tgz
+runtime/
+.releases/
 .tmp
 .cache
 

@@ -24,11 +24,10 @@ jobs:
         python-version: "3.12"
     
     - name: Install dependencies
-      run: UV_GIT_LFS=1 uv sync --dev
+      run: uv sync --locked --dev
         
     - name: Run tests
-      env:
-        LIVEKIT_URL: ${{ secrets.LIVEKIT_URL }}
-        LIVEKIT_API_KEY: ${{ secrets.LIVEKIT_API_KEY }}
-        LIVEKIT_API_SECRET: ${{ secrets.LIVEKIT_API_SECRET }}
-      run: uv run pytest -v
+      run: uv run --locked pytest -q
+
+    - name: Check Python
+      run: uv run --locked ruff check src tests
